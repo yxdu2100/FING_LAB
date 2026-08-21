@@ -1,0 +1,10 @@
+#ifndef APP_CONFIG_H
+#define APP_CONFIG_H
+
+#define TOF_MIN_DISTANCE_MM 60U
+#define TOF_MAX_DISTANCE_MM 500U
+#define CAMERA_CAPTURE_MAX_ATTEMPTS 5
+
+#define EVENT_IMU_DOUBLE_FLICK (1U << 0)
+
+#endif

@@ -10,9 +10,22 @@
 		11E1F72C30389EDA00A5EFE3 /* fing_lab.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = fing_lab.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		11E1F74030389EDB00A5EFE3 /* Exceptions for "fing_lab" folder in "fing_lab" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 11E1F72B30389EDA00A5EFE3 /* fing_lab */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		11E1F72E30389EDA00A5EFE3 /* fing_lab */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				11E1F74030389EDB00A5EFE3 /* Exceptions for "fing_lab" folder in "fing_lab" target */,
+			);
 			path = fing_lab;
 			sourceTree = "<group>";
 		};
@@ -256,6 +269,7 @@
 				DEVELOPMENT_TEAM = 8BDVU68JXP;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = fing_lab/Info.plist;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Fing Lab connects to the ring to receive gesture-triggered photos.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -289,6 +303,7 @@
 				DEVELOPMENT_TEAM = 8BDVU68JXP;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = fing_lab/Info.plist;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Fing Lab connects to the ring to receive gesture-triggered photos.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

@@ -41,6 +41,7 @@ static const struct device *const gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 static struct gpio_callback int_callback;
 static struct k_work int_work;
 static imu_double_flick_callback_t double_flick_callback;
+static volatile bool mlc_enabled;
 
 static int reg_write(uint8_t address, uint8_t value)
 {
@@ -139,6 +140,10 @@ static void interrupt_work_handler(struct k_work *work)
 
     ARG_UNUSED(work);
 
+    if (!mlc_enabled) {
+        return;
+    }
+
     int err = reg_read(REG_ALL_INT_SRC, &all_interrupts);
     if (err != 0) {
         LOG_ERR("Cannot read ALL_INT_SRC: %d", err);
@@ -171,7 +176,7 @@ static void interrupt_work_handler(struct k_work *work)
         return;
     }
 
-    if (mlc_result == MLC_CODE_DOUBLE_FLICK) {
+    if (mlc_enabled && mlc_result == MLC_CODE_DOUBLE_FLICK) {
         LOG_INF("Double flick detected (MLC1_SRC=0x00)");
         if (double_flick_callback != NULL) {
             double_flick_callback();
@@ -190,7 +195,9 @@ static void interrupt_handler(const struct device *device,
     ARG_UNUSED(pins);
 
     /* Keep I2C and all capture work outside interrupt context. */
-    (void)k_work_submit(&int_work);
+    if (mlc_enabled) {
+        (void)k_work_submit(&int_work);
+    }
 }
 
 int imu_init(imu_double_flick_callback_t callback)
@@ -218,16 +225,52 @@ int imu_init(imu_double_flick_callback_t callback)
         return err;
     }
 
+    mlc_enabled = false;
+    LOG_INF("MLC interrupt endpoint initialized on GPIO1.%u", IMU_INT_PIN);
+    return 0;
+}
+
+int imu_start_mlc(void)
+{
+    int err = gpio_pin_interrupt_configure(gpio1, IMU_INT_PIN, GPIO_INT_DISABLE);
+
+    if (err != 0) {
+        return err;
+    }
+    mlc_enabled = false;
+
     err = load_mlc_configuration();
     if (err != 0) {
         return err;
     }
 
+    mlc_enabled = true;
     err = gpio_pin_interrupt_configure(gpio1, IMU_INT_PIN, GPIO_INT_EDGE_TO_ACTIVE);
     if (err != 0) {
+        mlc_enabled = false;
         return err;
     }
 
     LOG_INF("MLC ready: INT1 / MLC1_SRC 0x70 / double_flick 0x00");
     return 0;
+}
+
+void imu_stop_mlc(void)
+{
+    struct k_work_sync sync;
+
+    mlc_enabled = false;
+    (void)gpio_pin_interrupt_configure(gpio1, IMU_INT_PIN, GPIO_INT_DISABLE);
+    (void)k_work_cancel_sync(&int_work, &sync);
+
+    /* Clear both embedded-function routing layers, then power the IMU down.
+     * The streaming profile will perform a complete register rewrite later. */
+    (void)select_embedded_bank(true);
+    (void)reg_write(0x0DU, 0x00U); /* MLC_INT1 */
+    (void)reg_write(0x05U, 0x00U); /* EMB_FUNC_EN_B / MLC_EN */
+    (void)select_embedded_bank(false);
+    (void)reg_write(0x5EU, 0x00U); /* MD1_CFG */
+    (void)reg_write(0x10U, 0x00U); /* CTRL1: accel power-down */
+    (void)reg_write(0x11U, 0x00U); /* CTRL2: gyro power-down */
+    LOG_INF("MLC stopped");
 }

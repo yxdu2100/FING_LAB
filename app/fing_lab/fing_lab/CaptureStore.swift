@@ -3,6 +3,9 @@ import UIKit
 
 struct SavedCapture: Identifiable {
     let id: String
+    /// Persistent app-side sequence number. Unlike the device frame ID, this
+    /// does not reset when the MCU or app reconnects.
+    let captureIndex: UInt64
     let frameID: UInt32
     let deviceTimestampMs: UInt32
     let receivedAt: Date
@@ -15,6 +18,8 @@ struct SavedCapture: Identifiable {
 }
 
 private struct CaptureMetadata: Codable {
+    /// Optional so captures saved by older app versions still load.
+    let captureIndex: UInt64?
     let frameID: UInt32
     let deviceTimestampMs: UInt32
     let receivedAt: Date
@@ -32,6 +37,9 @@ final class CaptureStore {
     private let root: URL
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private var nextCaptureIndex: UInt64 = 0
+
+    private static let nextCaptureIndexKey = "FingLabCaptures.nextCaptureIndex"
 
     init() {
         let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -42,11 +50,23 @@ final class CaptureStore {
         decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let existingMaximum = load().map(\.captureIndex).max()
+        let inferredNext = existingMaximum.map { $0 &+ 1 } ?? 0
+        let persistedNext = (UserDefaults.standard.object(
+            forKey: Self.nextCaptureIndexKey
+        ) as? NSNumber)?.uint64Value ?? 0
+        nextCaptureIndex = max(inferredNext, persistedNext)
+        UserDefaults.standard.set(
+            NSNumber(value: nextCaptureIndex),
+            forKey: Self.nextCaptureIndexKey
+        )
     }
 
     func save(frame: ReassembledFrame, image: UIImage) throws -> SavedCapture {
         let receivedAt = Date()
-        let id = String(format: "frame_%010u_%lld", frame.header.frameID,
+        let captureIndex = nextCaptureIndex
+        let id = String(format: "capture_%010llu_%lld", captureIndex,
                         Int64(receivedAt.timeIntervalSince1970 * 1_000))
         let imageURL = root.appendingPathComponent(id + ".png")
         let rawURL = root.appendingPathComponent(id + ".bayer")
@@ -55,6 +75,7 @@ final class CaptureStore {
 
         let configuration = CameraConfiguration.current
         let metadata = CaptureMetadata(
+            captureIndex: captureIndex,
             frameID: frame.header.frameID,
             deviceTimestampMs: frame.header.timestampMs,
             receivedAt: receivedAt,
@@ -78,7 +99,13 @@ final class CaptureStore {
             throw error
         }
 
-        return SavedCapture(id: id, frameID: metadata.frameID,
+        nextCaptureIndex &+= 1
+        UserDefaults.standard.set(
+            NSNumber(value: nextCaptureIndex),
+            forKey: Self.nextCaptureIndexKey
+        )
+
+        return SavedCapture(id: id, captureIndex: captureIndex, frameID: metadata.frameID,
                             deviceTimestampMs: metadata.deviceTimestampMs,
                             receivedAt: receivedAt, imageURL: imageURL,
                             rawURL: rawURL, metadataURL: metadataURL, image: image)
@@ -89,7 +116,7 @@ final class CaptureStore {
             at: root, includingPropertiesForKeys: nil
         ))?.filter { $0.pathExtension == "json" } ?? []
 
-        return metadataURLs.compactMap { url in
+        let candidates = metadataURLs.compactMap { url -> (URL, CaptureMetadata, UIImage)? in
             guard
                 let data = try? Data(contentsOf: url),
                 let metadata = try? decoder.decode(CaptureMetadata.self, from: data)
@@ -99,8 +126,48 @@ final class CaptureStore {
             let rawURL = root.appendingPathComponent(metadata.rawFile)
             guard let image = UIImage(contentsOfFile: imageURL.path),
                   fileManager.fileExists(atPath: rawURL.path) else { return nil }
+
+            return (url, metadata, image)
+        }.sorted { $0.1.receivedAt < $1.1.receivedAt }
+
+        // Legacy captures did not store captureIndex. Assign them stable
+        // chronological indices while avoiding indices already persisted by
+        // newer captures.
+        var usedIndices = Set(candidates.compactMap { $0.1.captureIndex })
+        var nextLegacyIndex: UInt64 = 0
+        let captures = candidates.map { url, metadata, image in
+            let captureIndex: UInt64
+            if let savedIndex = metadata.captureIndex {
+                captureIndex = savedIndex
+            } else {
+                while usedIndices.contains(nextLegacyIndex) { nextLegacyIndex &+= 1 }
+                captureIndex = nextLegacyIndex
+                usedIndices.insert(captureIndex)
+                nextLegacyIndex &+= 1
+
+                // Persist the inferred value once so deleting another legacy
+                // capture later cannot renumber the remaining gallery.
+                let migratedMetadata = CaptureMetadata(
+                    captureIndex: captureIndex,
+                    frameID: metadata.frameID,
+                    deviceTimestampMs: metadata.deviceTimestampMs,
+                    receivedAt: metadata.receivedAt,
+                    rawWidth: metadata.rawWidth,
+                    rawHeight: metadata.rawHeight,
+                    outputWidth: metadata.outputWidth,
+                    outputHeight: metadata.outputHeight,
+                    bayerPattern: metadata.bayerPattern,
+                    rawFile: metadata.rawFile,
+                    imageFile: metadata.imageFile
+                )
+                try? encoder.encode(migratedMetadata).write(to: url, options: .atomic)
+            }
+
+            let imageURL = root.appendingPathComponent(metadata.imageFile)
+            let rawURL = root.appendingPathComponent(metadata.rawFile)
             return SavedCapture(
                 id: url.deletingPathExtension().lastPathComponent,
+                captureIndex: captureIndex,
                 frameID: metadata.frameID,
                 deviceTimestampMs: metadata.deviceTimestampMs,
                 receivedAt: metadata.receivedAt,
@@ -109,7 +176,9 @@ final class CaptureStore {
                 metadataURL: url,
                 image: image
             )
-        }.sorted { $0.receivedAt > $1.receivedAt }
+        }
+
+        return captures.sorted { $0.receivedAt > $1.receivedAt }
     }
 
     func delete(_ capture: SavedCapture) throws {

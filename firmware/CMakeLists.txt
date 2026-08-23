@@ -9,14 +9,17 @@ project(fing_lab_capture)
 target_sources(app PRIVATE
     src/main.c
     src/ble/ble.c
+    src/modes/mode_manager.c
     src/modules/camera/camera.c
     src/modules/imu/imu.c
+    src/modules/imu/imu_stream.c
     src/modules/tof/tof.c
 )
 
 target_include_directories(app PRIVATE
     src
     src/ble
+    src/modes
     src/modules/camera
     src/modules/imu
     src/modules/tof

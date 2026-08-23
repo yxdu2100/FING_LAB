@@ -3,7 +3,13 @@
 
 typedef void (*imu_double_flick_callback_t)(void);
 
-/* Loads the exact MEMS Studio table in mlc.h and arms INT1. */
+/* Initializes the shared INT1 GPIO callback without selecting an IMU profile. */
 int imu_init(imu_double_flick_callback_t callback);
+
+/* Loads the exact MEMS Studio table in mlc.h and arms INT1 for MLC1. */
+int imu_start_mlc(void);
+
+/* Disarms MLC/INT1 and powers down accelerometer and gyroscope. */
+void imu_stop_mlc(void);
 
 #endif

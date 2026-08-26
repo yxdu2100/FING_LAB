@@ -133,7 +133,9 @@ final class RingBLEManager: NSObject {
 
     private func writeCommand(_ byte: UInt8) {
         guard let peripheral, let commandCharacteristic else { return }
-        peripheral.writeValue(Data([byte]), for: commandCharacteristic, type: .withoutResponse)
+        // Mode transitions are infrequent and must not be silently dropped,
+        // especially while image notifications are using most of the link.
+        peripheral.writeValue(Data([byte]), for: commandCharacteristic, type: .withResponse)
     }
 
     private func startKeepalive() {
@@ -228,6 +230,14 @@ extension RingBLEManager: CBCentralManagerDelegate {
 }
 
 extension RingBLEManager: CBPeripheralDelegate {
+    func peripheral(_ peripheral: CBPeripheral,
+                    didWriteValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard characteristic.uuid == BLEConstants.commandUUID,
+              let error else { return }
+        errorMessage = "Could not send firmware mode command: \(error.localizedDescription)"
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil,
               let service = peripheral.services?.first(where: { $0.uuid == BLEConstants.serviceUUID })

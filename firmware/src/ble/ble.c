@@ -25,6 +25,8 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define MAX_PAYLOAD_CHUNK 244U
 #define ADV_RESTART_RETRY_DELAY_MS 50
 #define ADV_RESTART_MAX_ATTEMPTS 20
+#define STATUS_NOTIFY_RETRY_DELAY_MS 20
+#define STATUS_NOTIFY_MAX_ATTEMPTS 50
 #define CONTROL_KEEPALIVE 3U
 
 #define BT_UUID_FING_SERVICE_VAL \
@@ -51,6 +53,8 @@ static uint8_t image_value;
 static uint8_t status_value = FING_MODE_IDLE;
 static uint8_t imu_value;
 static uint8_t advertising_restart_attempts;
+static uint8_t status_notify_attempts;
+static volatile uint8_t control_requested_mode = FING_MODE_IDLE;
 static ble_mode_request_callback_t mode_request_callback;
 
 static void image_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -101,6 +105,9 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
         return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
     }
 
+    /* Publish the request before waking the mode manager.  Image notification
+     * loops use this value to stop promptly when the app requests IDLE. */
+    control_requested_mode = command;
     LOG_INF("App requested mode %u", command);
     if (mode_request_callback != NULL) {
         mode_request_callback((enum fing_mode)command);
@@ -124,6 +131,38 @@ BT_GATT_SERVICE_DEFINE(fing_service,
         BT_GATT_CHRC_NOTIFY, 0, NULL, NULL, &imu_value),
     BT_GATT_CCC(imu_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
+
+static void status_notify_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(status_notify_work, status_notify_work_handler);
+
+static void status_notify_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (current_connection == NULL || !status_notifications_enabled) {
+        status_notify_attempts = 0U;
+        return;
+    }
+
+    int err = bt_gatt_notify(current_connection,
+                             &fing_service.attrs[ATTR_STATUS_VALUE_INDEX],
+                             &status_value, sizeof(status_value));
+    if (err == 0) {
+        status_notify_attempts = 0U;
+        return;
+    }
+
+    if ((err == -ENOMEM || err == -EAGAIN) &&
+        status_notify_attempts < STATUS_NOTIFY_MAX_ATTEMPTS) {
+        status_notify_attempts++;
+        (void)k_work_reschedule(&status_notify_work,
+                                K_MSEC(STATUS_NOTIFY_RETRY_DELAY_MS));
+        return;
+    }
+
+    LOG_WRN("Could not notify mode status %u: %d", status_value, err);
+    status_notify_attempts = 0U;
+}
 
 static const struct bt_data advertising_data[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
@@ -205,6 +244,8 @@ static void disconnected(struct bt_conn *connection, uint8_t reason)
     image_notifications_enabled = false;
     status_notifications_enabled = false;
     imu_notifications_enabled = false;
+    control_requested_mode = FING_MODE_IDLE;
+    (void)k_work_cancel_delayable(&status_notify_work);
     if (current_connection != NULL) {
         bt_conn_unref(current_connection);
         current_connection = NULL;
@@ -237,14 +278,8 @@ int ble_init(ble_mode_request_callback_t callback)
 void ble_set_active_mode(enum fing_mode mode)
 {
     status_value = (uint8_t)mode;
-    if (current_connection != NULL && status_notifications_enabled) {
-        int err = bt_gatt_notify(current_connection,
-                                 &fing_service.attrs[ATTR_STATUS_VALUE_INDEX],
-                                 &status_value, sizeof(status_value));
-        if (err != 0) {
-            LOG_WRN("Could not notify mode status: %d", err);
-        }
-    }
+    status_notify_attempts = 0U;
+    (void)k_work_reschedule(&status_notify_work, K_NO_WAIT);
 }
 
 enum fing_mode ble_get_active_mode(void)
@@ -260,7 +295,8 @@ bool ble_is_connected(void)
 bool ble_can_send_frame(void)
 {
     return status_value == FING_MODE_CAPTURE && current_connection != NULL &&
-           image_notifications_enabled;
+           image_notifications_enabled &&
+           control_requested_mode == FING_MODE_CAPTURE;
 }
 
 static int notify_image_with_retry(const uint8_t *data, uint16_t length)
@@ -280,6 +316,9 @@ static int notify_image_with_retry(const uint8_t *data, uint16_t length)
             return -ETIMEDOUT;
         }
         k_usleep(NOTIFY_RETRY_SLEEP_US);
+    }
+    if (control_requested_mode != FING_MODE_CAPTURE) {
+        return -ECANCELED;
     }
     return -ENOTCONN;
 }

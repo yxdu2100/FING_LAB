@@ -25,8 +25,8 @@ static uint8_t frame_buf[FRAME_BYTES];
  *
  * With the HM01B0 running at 1 MHz vt_pix_clk, line_length_pck = 625:
  *   line period  ~= 625 us       (active 324 us + H-blank ~301 us)
- *   V-blank      ~= 515 ms       (823 blank lines * 625 us)
- *   frame period ~= 667 ms       (1.5 FPS)
+ *   V-blank      ~= 97.5 ms      (156 blank lines * 625 us)
+ *   frame period ~= 250 ms       (4 FPS)
  *
  * LINE_TIMEOUT_US   : must be  >  1 line-period + scheduler jitter
  *                              <  V-blank duration
@@ -34,7 +34,7 @@ static uint8_t frame_buf[FRAME_BYTES];
  * MAX_PROBE_LINES   : worst-case probes to walk through one active region
  */
 #define LINE_TIMEOUT_US   2500u
-#define VBLANK_WAIT_MS    700u
+#define VBLANK_WAIT_MS    350u
 #define MAX_PROBE_LINES   (IMG_H + 20)
 #define CAMERA_STREAM_REG_RETRIES 3
 #define CAMERA_STREAM_REG_RETRY_DELAY_MS 20
@@ -103,6 +103,61 @@ int camera_write_reg(const struct device *i2c_dev, uint16_t reg, uint8_t value)
         return ret;
     }
 
+    return 0;
+}
+
+static int camera_read_reg(uint16_t reg, uint8_t *value)
+{
+    uint8_t address[2] = {
+        (uint8_t)(reg >> 8),
+        (uint8_t)(reg & 0xFF),
+    };
+
+    if (value == NULL) {
+        return -EINVAL;
+    }
+    return i2c_write_read(i2c_dev, camera_ADDR,
+                          address, sizeof(address), value, 1);
+}
+
+int camera_log_ae_state(unsigned int burst_frame)
+{
+    uint8_t frame_count;
+    uint8_t integration_h;
+    uint8_t integration_l;
+    uint8_t analog_gain;
+    uint8_t digital_gain_h;
+    uint8_t digital_gain_l;
+
+    int err = camera_read_reg(0x0005, &frame_count);
+    if (err == 0) {
+        err = camera_read_reg(0x0202, &integration_h);
+    }
+    if (err == 0) {
+        err = camera_read_reg(0x0203, &integration_l);
+    }
+    if (err == 0) {
+        err = camera_read_reg(0x0205, &analog_gain);
+    }
+    if (err == 0) {
+        err = camera_read_reg(0x020E, &digital_gain_h);
+    }
+    if (err == 0) {
+        err = camera_read_reg(0x020F, &digital_gain_l);
+    }
+    if (err != 0) {
+        LOG_WRN("Could not read AE state after burst frame %u: %d",
+                burst_frame, err);
+        return err;
+    }
+
+    uint16_t integration = ((uint16_t)integration_h << 8) | integration_l;
+    uint16_t digital_gain = ((uint16_t)(digital_gain_h & 0x03U) << 8) |
+                            (digital_gain_l & 0xFCU);
+    LOG_INF("AE burst %u: sensor_frame=%u integration=%u rows "
+            "again=0x%02x dgain=0x%03x",
+            burst_frame, frame_count, integration,
+            analog_gain, digital_gain);
     return 0;
 }
 

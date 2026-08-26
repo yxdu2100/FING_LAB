@@ -24,7 +24,9 @@ struct CaptureStudyView: View {
             coordinator.ble.enterCaptureMode()
         }
         .onDisappear {
-            if !coordinator.isActiveSession { coordinator.ble.enterIdleMode() }
+            // Phase 1/2 owns CAPTURE mode. Always release the camera and MCLK
+            // when this screen goes away so it cannot leak into Phase 3/4.
+            coordinator.ble.enterIdleMode()
         }
         .alert("Capture Error", isPresented: Binding(
             get: { coordinator.captureError != nil },

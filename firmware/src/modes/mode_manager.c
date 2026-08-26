@@ -24,9 +24,11 @@ K_EVENT_DEFINE(mode_events);
 static volatile enum fing_mode requested_mode = FING_MODE_IDLE;
 static enum fing_mode active_mode = FING_MODE_IDLE;
 static uint32_t next_frame_id;
+static volatile uint32_t last_trigger_ms;
 
 static void on_double_flick(void)
 {
+    last_trigger_ms = k_uptime_get_32();
     k_event_post(&mode_events, EVENT_CAPTURE_TRIGGER);
 }
 
@@ -53,6 +55,35 @@ static int capture_full_frame(void)
         k_msleep(50);
     }
     return result;
+}
+
+static int capture_ae_stabilized_frame(void)
+{
+    const unsigned int total_frames = CAMERA_AE_DISCARD_FRAMES + 1U;
+
+    for (unsigned int frame = 1U; frame <= total_frames; ++frame) {
+        /* The BLE callback updates requested_mode immediately, even while the
+         * mode-manager thread is inside this blocking burst.  Check it between
+         * frames so IDLE does not have to wait for the complete burst. */
+        if (requested_mode != FING_MODE_CAPTURE) {
+            LOG_INF("AE burst cancelled after %u/%u frames",
+                    frame - 1U, total_frames);
+            return -ECANCELED;
+        }
+
+        int result = capture_full_frame();
+        if (result != FRAME_BYTES) {
+            return result;
+        }
+
+        (void)camera_log_ae_state(frame);
+        if (frame <= CAMERA_AE_DISCARD_FRAMES) {
+            LOG_INF("Discarded AE settling frame %u/%u",
+                    frame, CAMERA_AE_DISCARD_FRAMES);
+        }
+    }
+
+    return FRAME_BYTES;
 }
 
 static void enter_idle(void)
@@ -128,6 +159,7 @@ static void handle_capture_trigger(void)
         return;
     }
 
+    uint32_t trigger_ms = last_trigger_ms;
     uint16_t distance_mm;
     int err = tof_measure_mm(&distance_mm);
     if (err != 0) {
@@ -140,11 +172,17 @@ static void handle_capture_trigger(void)
         return;
     }
 
-    int length = capture_full_frame();
+    int length = capture_ae_stabilized_frame();
+    if (length == -ECANCELED) {
+        LOG_INF("Capture cancelled by mode request");
+        return;
+    }
     if (length != FRAME_BYTES) {
         LOG_ERR("Camera capture failed: %d", length);
         return;
     }
+    LOG_INF("Final image ready %u ms after MLC trigger",
+            k_uptime_get_32() - trigger_ms);
     if (!ble_can_send_frame()) {
         LOG_WRN("Photo captured but app is not subscribed; photo discarded");
         return;
@@ -152,8 +190,13 @@ static void handle_capture_trigger(void)
 
     uint8_t *frame = camera_get_frame_buffer();
     err = ble_send_frame(frame, FRAME_BYTES, next_frame_id++, k_uptime_get_32());
-    if (err != 0) {
+    if (err == -ECANCELED) {
+        LOG_INF("BLE image transfer cancelled by mode request");
+    } else if (err != 0) {
         LOG_ERR("BLE image transfer failed: %d", err);
+    } else {
+        LOG_INF("Image handed to BLE %u ms after MLC trigger",
+                k_uptime_get_32() - trigger_ms);
     }
 }
 

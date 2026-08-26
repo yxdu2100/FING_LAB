@@ -83,8 +83,12 @@ struct sensor_reg hm01b0_324x244[] = {
     {0x0342,0x02},
     {0x0343,0x71},//625 line_length_pck
 
-    {0x0340,0x04},
-    {0x0341,0x2B},//1067 frame_length_lines => ~1.5 FPS @ 1 MHz vt_pix_clk
+    /* Keep the 625-pixel line period so the MCU retains ~301 us of
+     * horizontal blanking to re-arm SPIS.  Shorten only vertical blanking:
+     * 1 MHz / (625 * 400) = 4 FPS.  MAX_INTG=376 remains valid because it is
+     * no greater than frame_length_lines - 2. */
+    {0x0340,0x01},
+    {0x0341,0x90},//400 frame_length_lines => 4 FPS @ 1 MHz vt_pix_clk
     // {0x0342,0x09},
     // {0x0343,0xC4},//2500
 

@@ -40,7 +40,6 @@ static int capture_full_frame(void)
 {
     int result = -EAGAIN;
 
-    camera_wake_up();
     for (int attempt = 1; attempt <= CAMERA_CAPTURE_MAX_ATTEMPTS; ++attempt) {
         result = camera_capture_frame();
         if (result == FRAME_BYTES) {
@@ -53,7 +52,6 @@ static int capture_full_frame(void)
                 attempt, CAMERA_CAPTURE_MAX_ATTEMPTS, result);
         k_msleep(50);
     }
-    camera_standby();
     return result;
 }
 
@@ -63,7 +61,7 @@ static void enter_idle(void)
      * That makes a mode acknowledgement mean its data path is fully quiet. */
     if (active_mode == FING_MODE_CAPTURE) {
         imu_stop_mlc();
-        camera_standby();
+        (void)camera_standby();
     } else if (active_mode == FING_MODE_STREAM) {
         imu_stream_stop();
     }
@@ -81,7 +79,17 @@ static int enter_mode(enum fing_mode target)
         return 0;
     }
     if (target == FING_MODE_CAPTURE) {
-        err = imu_start_mlc();
+        /* Wake the camera once for the complete Phase 1/2 session.  Keeping
+         * MCLK running between gestures avoids the unreliable repeated
+         * stop/start cycle that caused the first photo to work and later
+         * photos to lose the camera's I2C acknowledgement. */
+        err = camera_wake_up();
+        if (err == 0) {
+            err = imu_start_mlc();
+        }
+        if (err != 0) {
+            (void)camera_standby();
+        }
     } else if (target == FING_MODE_STREAM) {
         err = imu_stream_start();
     } else {
@@ -151,19 +159,27 @@ static void handle_capture_trigger(void)
 
 int mode_manager_init(void)
 {
-    camera_init();
-
-    int err = tof_init();
-    if (err != 0) {
-        return err;
-    }
-    err = imu_init(on_double_flick);
+    /* Match the known-good FingCam boot ordering: initialize the IMU side
+     * before touching the camera.  ToF is also placed first so its 100 ms
+     * power-up interval has elapsed before camera MCLK/register setup. */
+    int err = imu_init(on_double_flick);
     if (err != 0) {
         return err;
     }
     err = imu_stream_init();
     if (err != 0) {
         return err;
+    }
+    err = tof_init();
+    if (err != 0) {
+        return err;
+    }
+    err = camera_init();
+    if (err != 0) {
+        /* Camera failure must not disable the independent Phase 3/4 IMU
+         * stream.  Entering CAPTURE will retry camera_wake_up(), while
+         * entering STREAM remains fully usable. */
+        LOG_ERR("Camera unavailable at boot: %d; CAPTURE will retry later", err);
     }
 
     active_mode = FING_MODE_IDLE;

@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <stdbool.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/spi.h>
@@ -34,6 +36,12 @@ static uint8_t frame_buf[FRAME_BYTES];
 #define LINE_TIMEOUT_US   2500u
 #define VBLANK_WAIT_MS    700u
 #define MAX_PROBE_LINES   (IMG_H + 20)
+#define CAMERA_STREAM_REG_RETRIES 3
+#define CAMERA_STREAM_REG_RETRY_DELAY_MS 20
+#define CAMERA_MCLK_SETTLE_MS 20
+#define CAMERA_BOOT_SETTLE_MS 100
+#define CAMERA_INIT_RETRIES 10
+#define CAMERA_INIT_RETRY_DELAY_MS 100
 
 /* Throwaway buffer used to swallow lines until we detect V-blank, and
  * to capture row 0 of the next frame (see camera_capture_frame). */
@@ -63,6 +71,8 @@ const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 static struct k_poll_signal line_done_sig;
 const struct device *spi_slave_dev;
 static struct k_poll_signal spi_slave_done_sig = K_POLL_SIGNAL_INITIALIZER(spi_slave_done_sig);
+
+static void mclk_stop(void);
 
 static const struct spi_config spi_slave_cfg = {
 	.operation = SPI_WORD_SET(8) | SPI_TRANSFER_MSB | 
@@ -96,7 +106,8 @@ int camera_write_reg(const struct device *i2c_dev, uint16_t reg, uint8_t value)
     return 0;
 }
 
-void camera_load_regs(const struct device *i2c_dev, const struct sensor_reg *reg_list)
+static int camera_load_regs(const struct device *i2c_dev,
+                            const struct sensor_reg *reg_list)
 {
     int ret;
 
@@ -108,17 +119,18 @@ void camera_load_regs(const struct device *i2c_dev, const struct sensor_reg *reg
         // End of list marker
         if (reg == 0xFFFF && val == 0xFF) {
             LOG_INF("Camera register init finished");
-            break;
+            return 0;
         }
 
         ret = camera_write_reg(i2c_dev, reg, val);
-        // if (ret) {
-        //     LOG_ERR("Failed to write reg 0x%04X", reg);
-        // }
+        if (ret != 0) {
+            LOG_ERR("Camera register init stopped at index %d "
+                    "(reg 0x%04X, err %d)", i, reg, ret);
+            return ret;
+        }
         k_usleep(500); // small delay to avoid SCCB timing issues
     }
 }
-
 
 ///* ---------- MCLK INIT ---------- */
 static void configure_mclk_gppi(void)
@@ -141,7 +153,7 @@ static void configure_mclk_gppi(void)
                                                             nrf_gpiote_out_task_get(MCLK_GPIOTE_CH));
 
     /*  - Connect the event to the task */
-    nrfx_gppi_channel_endpoints_setup(gppi_channel, 
+    nrfx_gppi_channel_endpoints_setup(gppi_channel,
                                       timer_compare_evt, 
                                       gpiote_task_addr);
 
@@ -152,7 +164,7 @@ static void configure_mclk_gppi(void)
 
 void mclk_init(void)
 {
-    LOG_INF("Starting 8MHz wave generator on P1.07 using register access + DPPI");
+    LOG_INF("Starting 8MHz wave generator on P1.08 using register access + DPPI");
 
     /* * Configure pin as output*/
     nrf_gpio_cfg_output(MCLK_PIN);
@@ -235,28 +247,64 @@ void lvld_cs_init(void)
     configure_lvld_cs_gppi();
 }
 
-void camera_init(void)
+int camera_init(void)
 {
+    int ret;
+
     // Initialize MCLK
     mclk_init();
     // Initialize I2C
     if (!device_is_ready(i2c_dev)) {
         LOG_ERR("I2C device not ready");
-        return;
+        return -ENODEV;
     }
-    // Load Camera Registers
-    camera_load_regs(i2c_dev, hm01b0_324x244);
 
-    // Initialize SPI Slave
+    /* Set up the MCU-side capture endpoint even if the sensor is temporarily
+     * absent.  A later CAPTURE-mode request can then retry the cold wake
+     * without dereferencing an uninitialized SPI device. */
     spi_slave_init();
-
-    /* Initialize the per-line completion signal exactly once, not per
-     * frame. Re-initializing while a transfer is pending would race
-     * with the SPIS ISR. */
+    if (!device_is_ready(spi_slave_dev)) {
+        LOG_ERR("SPI slave device not ready");
+        mclk_stop();
+        return -ENODEV;
+    }
     k_poll_signal_init(&line_done_sig);
 
+    /* The integrated firmware reaches main() much sooner than the original
+     * camera-only firmware.  Give both the camera rails and the newly-started
+     * MCLK time to settle before the first SCCB/I2C transaction. */
+    k_msleep(CAMERA_BOOT_SETTLE_MS);
+
+    // Load Camera Registers
+    for (int attempt = 1; attempt <= CAMERA_INIT_RETRIES; ++attempt) {
+        ret = camera_load_regs(i2c_dev, hm01b0_324x244);
+        if (ret == 0) {
+            break;
+        }
+
+        LOG_WRN("Camera register init attempt %d/%d failed: %d",
+                attempt, CAMERA_INIT_RETRIES, ret);
+        if (attempt < CAMERA_INIT_RETRIES) {
+            k_msleep(CAMERA_INIT_RETRY_DELAY_MS);
+        }
+    }
+    if (ret != 0) {
+        LOG_ERR("Camera at I2C address 0x%02x never acknowledged; "
+                "check 1.8 V/DVDD, MCLK P1.08, and the flex connector",
+                camera_ADDR);
+        mclk_stop();
+        (void)pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_SUSPEND);
+        return ret;
+    }
+
     LOG_INF("Camera initialization complete");
-    camera_standby();
+    ret = camera_standby();
+    if (ret != 0) {
+        LOG_ERR("Initial camera standby failed: %d", ret);
+        return ret;
+    }
+
+    return 0;
 }
 
 
@@ -381,23 +429,31 @@ int camera_capture_frame(void)
 }
 
 
-void mclk_stop(void)
+static void mclk_stop(void)
 {
     NRF_TIMER_REG->TASKS_STOP = 1;
     NRF_TIMER_REG->TASKS_CLEAR = 1;
     LOG_INF("MCLK Stopped");
 }
 
-void camera_standby(void)
+int camera_standby(void)
 {
-    camera_write_reg(i2c_dev, 0x0100, 0x00); 
+    int first_err = camera_write_reg(i2c_dev, 0x0100, 0x00);
+    if (first_err) {
+        LOG_ERR("Camera standby stream-off failed: %d", first_err);
+    }
     k_msleep(10);
     mclk_stop();
+    k_poll_signal_reset(&line_done_sig);
     int err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_SUSPEND);
     if (err) {
         LOG_ERR("Failed to suspend SPI Slave: %d", err);
+        if (first_err == 0) {
+            first_err = err;
+        }
     }
     LOG_INF("Camera Standby & SPI Slave Suspended");
+    return first_err;
 }
 
 uint8_t* camera_get_frame_buffer(void)
@@ -406,16 +462,56 @@ uint8_t* camera_get_frame_buffer(void)
 }
 
 
-void camera_wake_up(void)
+static int camera_start_streaming_with_retry(void)
+{
+    int err = 0;
+
+    for (int attempt = 1; attempt <= CAMERA_STREAM_REG_RETRIES; attempt++) {
+        err = camera_write_reg(i2c_dev, 0x0100, 0x01);
+        if (err == 0) {
+            if (attempt > 1) {
+                LOG_INF("Camera stream-on succeeded after %d attempts", attempt);
+            }
+            return 0;
+        }
+
+        LOG_WRN("Camera stream-on attempt %d/%d failed: %d",
+                attempt, CAMERA_STREAM_REG_RETRIES, err);
+        k_msleep(CAMERA_STREAM_REG_RETRY_DELAY_MS);
+    }
+
+    return err;
+}
+
+int camera_wake_up(void)
 {
     LOG_INF("Waking up Camera, MCLK & SPI Slave...");
     int err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_RESUME);
-    if (err) {
+    if (err != 0 && err != -EALREADY) {
         LOG_ERR("Failed to resume SPI Slave: %d", err);
+        return err;
     }
 
     NRF_TIMER_REG->TASKS_START = 1;
-    k_msleep(5);
-    camera_write_reg(i2c_dev, 0x0100, 0x01); 
-    k_msleep(50);
+    k_msleep(CAMERA_MCLK_SETTLE_MS);
+
+    err = camera_start_streaming_with_retry();
+    if (err != 0) {
+        LOG_WRN("Camera stream-on failed after retries, reloading registers");
+        err = camera_load_regs(i2c_dev, hm01b0_324x244);
+        if (err != 0) {
+            LOG_ERR("Camera register reload failed during wake: %d", err);
+            return err;
+        }
+
+        err = camera_start_streaming_with_retry();
+        if (err != 0) {
+            LOG_ERR("Camera stream-on still failed after register reload: %d", err);
+            return err;
+        }
+    }
+
+    k_msleep(100);
+    LOG_INF("Camera wake complete");
+    return 0;
 }

@@ -10,6 +10,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
+#include "app_config.h"
 #include "imu.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-const-variable"
@@ -31,8 +32,6 @@ LOG_MODULE_REGISTER(imu_module, LOG_LEVEL_INF);
 #define FUNC_CFG_EMBEDDED_BANK BIT(7)
 #define ALL_INT_SRC_EMB_FUNC_IA BIT(7)
 #define MLC_STATUS_MLC1 BIT(0)
-#define MLC_CODE_DOUBLE_FLICK 0x00U
-
 #define MLC_POLL_INTERVAL_MS 1U
 #define MLC_POLL_TIMEOUT_MS 100U
 
@@ -40,7 +39,7 @@ static const struct device *const i2c_bus = DEVICE_DT_GET(IMU_I2C_NODE);
 static const struct device *const gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 static struct gpio_callback int_callback;
 static struct k_work int_work;
-static imu_double_flick_callback_t double_flick_callback;
+static imu_gesture_callback_t gesture_callback;
 static volatile bool mlc_enabled;
 
 static int reg_write(uint8_t address, uint8_t value)
@@ -176,10 +175,10 @@ static void interrupt_work_handler(struct k_work *work)
         return;
     }
 
-    if (mlc_enabled && mlc_result == MLC_CODE_DOUBLE_FLICK) {
-        LOG_INF("Double flick detected (MLC1_SRC=0x00)");
-        if (double_flick_callback != NULL) {
-            double_flick_callback();
+    if (mlc_enabled && mlc_result == CAPTURE_MLC_TARGET_CLASS) {
+        LOG_INF("Configured gesture detected (MLC1_SRC=0x%02x)", mlc_result);
+        if (gesture_callback != NULL) {
+            gesture_callback();
         }
     } else {
         LOG_INF("MLC class 0x%02x ignored", mlc_result);
@@ -200,7 +199,7 @@ static void interrupt_handler(const struct device *device,
     }
 }
 
-int imu_init(imu_double_flick_callback_t callback)
+int imu_init(imu_gesture_callback_t callback)
 {
     int err;
 
@@ -208,7 +207,7 @@ int imu_init(imu_double_flick_callback_t callback)
         return -ENODEV;
     }
 
-    double_flick_callback = callback;
+    gesture_callback = callback;
     k_work_init(&int_work, interrupt_work_handler);
 
     err = gpio_pin_configure(gpio1, IMU_INT_PIN, GPIO_INPUT);
@@ -251,7 +250,8 @@ int imu_start_mlc(void)
         return err;
     }
 
-    LOG_INF("MLC ready: INT1 / MLC1_SRC 0x70 / double_flick 0x00");
+    LOG_INF("MLC ready: INT1 / MLC1_SRC 0x70 / target class 0x%02x",
+            CAPTURE_MLC_TARGET_CLASS);
     return 0;
 }
 

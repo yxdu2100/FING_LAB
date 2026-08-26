@@ -47,25 +47,79 @@ struct CaptureStudyView: View {
     }
 
     private var statusCard: some View {
-        HStack(spacing: 12) {
-            Circle()
-                .fill(coordinator.ble.activeMode == .capture ? Color.green : Color.orange)
-                .frame(width: 12, height: 12)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(coordinator.ble.connectionState.label).font(.headline)
-                Text(coordinator.ble.activeMode == .capture
-                     ? "Capture mode ready"
-                     : "Preparing capture mode…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(coordinator.ble.activeMode == .capture ? Color.green : Color.orange)
+                    .frame(width: 12, height: 12)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(coordinator.ble.connectionState.label).font(.headline)
+                    Text(coordinator.ble.activeMode == .capture
+                         ? "Capture mode ready"
+                         : "Preparing capture mode…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Reconnect") {
+                    coordinator.ble.setAutoReconnect(true)
+                    coordinator.ble.connect()
+                    coordinator.ble.enterCaptureMode()
+                }
+                .buttonStyle(.bordered)
             }
-            Spacer()
-            Button("Reconnect") {
-                coordinator.ble.setAutoReconnect(true)
-                coordinator.ble.connect()
-                coordinator.ble.enterCaptureMode()
+
+            Divider()
+
+            let status = coordinator.ble.latestCaptureStatus
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: status.event.systemImage)
+                    .font(.title2)
+                    .foregroundStyle(statusColor(status.event))
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(status.event.title)
+                        .font(.headline)
+                    Text(statusDescription(status))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    if status.attemptID > 0 {
+                        Text("Attempt \(status.attemptID)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+                if status.event.permitsResend {
+                    Button("Resend") { coordinator.ble.resendLastImage() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(coordinator.ble.activeMode != .capture)
+                }
             }
-            .buttonStyle(.bordered)
+
+            if !coordinator.ble.captureStatusHistory.isEmpty {
+                DisclosureGroup("Recent capture events") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(coordinator.ble.captureStatusHistory.prefix(8)) { event in
+                            HStack {
+                                Image(systemName: event.event.systemImage)
+                                    .foregroundStyle(statusColor(event.event))
+                                    .frame(width: 20)
+                                Text(event.event.title)
+                                Spacer()
+                                if let distance = event.distanceMm {
+                                    Text("\(distance) mm")
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .font(.caption)
+                        }
+                    }
+                    .padding(.top, 8)
+                }
+                .font(.subheadline)
+            }
         }
         .padding()
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -91,12 +145,59 @@ struct CaptureStudyView: View {
                     ContentUnavailableView(
                         "Waiting for a photo",
                         systemImage: "camera",
-                        description: Text("Double flick to run the ToF check and capture.")
+                        description: Text("Waiting for a gesture to check distance and capture.")
                     )
                     .foregroundStyle(.white)
                 }
             }
             .aspectRatio(4.0 / 3.0, contentMode: .fit)
+        }
+    }
+
+    private func statusDescription(_ status: CaptureStatus) -> String {
+        switch status.event {
+        case .waiting:
+            return "The ring is armed and waiting for a gesture."
+        case .gestureDetected:
+            return "The ring recognized the gesture."
+        case .tofChecking:
+            return "Measuring camera-to-surface distance…"
+        case .tofAccepted:
+            return "\(status.distanceMm ?? 0) mm is within the 60–500 mm range."
+        case .tofRejected:
+            return "\(status.distanceMm ?? 0) mm is outside the 60–500 mm range; no photo was taken."
+        case .tofError:
+            return "The ToF measurement failed (firmware error \(status.detail))."
+        case .exposureSettling:
+            return "Frame \(status.progress) of \(status.total); earlier frames are discarded."
+        case .imageReady:
+            return "The exposure-settled frame is ready to send."
+        case .transferStarted:
+            return "Transferring the 324 × 244 Bayer frame over BLE."
+        case .transferComplete:
+            return "The complete frame was queued to the phone."
+        case .transferFailed:
+            return "The frame is retained on the ring. Reconnect if needed, then tap Resend."
+        case .cameraError:
+            return "Capture failed before an image was available (firmware error \(status.detail))."
+        case .cancelled:
+            return "The capture stopped because the firmware left capture mode."
+        case .resendAvailable:
+            return "A previous frame was interrupted and is still available."
+        case .resendStarted:
+            return "Restarting the retained image transfer from the beginning."
+        case .awaitingAppAcknowledgement:
+            return "The full frame was queued; waiting for the app to confirm it was saved."
+        }
+    }
+
+    private func statusColor(_ event: CaptureStatusEvent) -> Color {
+        switch event {
+        case .waiting: .secondary
+        case .tofRejected, .cancelled, .resendAvailable: .orange
+        case .tofError, .transferFailed, .cameraError: .red
+        case .transferComplete: .green
+        default: .blue
         }
     }
 

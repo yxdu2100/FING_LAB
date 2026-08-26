@@ -11,6 +11,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/crc.h>
 #include <zephyr/sys/util.h>
 
 #include "ble.h"
@@ -20,6 +21,7 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define ATTR_IMAGE_VALUE_INDEX 2
 #define ATTR_STATUS_VALUE_INDEX 7
 #define ATTR_IMU_VALUE_INDEX 10
+#define ATTR_CAPTURE_STATUS_VALUE_INDEX 13
 #define NOTIFY_RETRY_TIMEOUT_MS 5000
 #define NOTIFY_RETRY_SLEEP_US 1000
 #define MAX_PAYLOAD_CHUNK 244U
@@ -28,6 +30,10 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define STATUS_NOTIFY_RETRY_DELAY_MS 20
 #define STATUS_NOTIFY_MAX_ATTEMPTS 50
 #define CONTROL_KEEPALIVE 3U
+#define CONTROL_RESEND_LAST_IMAGE 4U
+#define CONTROL_ACK_FRAME 5U
+#define CAPTURE_STATUS_PACKET_LENGTH 16U
+#define CAPTURE_STATUS_VERSION 1U
 
 #define BT_UUID_FING_SERVICE_VAL \
     BT_UUID_128_ENCODE(0x12345678, 0x9abc, 0x11ee, 0xbe56, 0x0242ac120002)
@@ -44,18 +50,30 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define BT_UUID_IMU_DATA_VAL \
     BT_UUID_128_ENCODE(0x1234567d, 0x9abc, 0x11ee, 0xbe56, 0x0242ac120002)
 #define BT_UUID_IMU_DATA BT_UUID_DECLARE_128(BT_UUID_IMU_DATA_VAL)
+#define BT_UUID_CAPTURE_STATUS_VAL \
+    BT_UUID_128_ENCODE(0x1234567e, 0x9abc, 0x11ee, 0xbe56, 0x0242ac120002)
+#define BT_UUID_CAPTURE_STATUS BT_UUID_DECLARE_128(BT_UUID_CAPTURE_STATUS_VAL)
 
 static struct bt_conn *current_connection;
 static bool image_notifications_enabled;
 static bool status_notifications_enabled;
 static bool imu_notifications_enabled;
+static bool capture_status_notifications_enabled;
 static uint8_t image_value;
 static uint8_t status_value = FING_MODE_IDLE;
 static uint8_t imu_value;
+static uint8_t capture_status_value[CAPTURE_STATUS_PACKET_LENGTH] = {
+    [0] = CAPTURE_STATUS_VERSION,
+    [1] = CAPTURE_STATUS_WAITING,
+    [10] = 0xFFU,
+    [11] = 0xFFU,
+};
 static uint8_t advertising_restart_attempts;
 static uint8_t status_notify_attempts;
 static volatile uint8_t control_requested_mode = FING_MODE_IDLE;
 static ble_mode_request_callback_t mode_request_callback;
+static ble_resend_request_callback_t resend_request_callback;
+static ble_frame_ack_callback_t frame_ack_callback;
 
 static void image_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -78,11 +96,36 @@ static void imu_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
     LOG_INF("IMU notifications %s", imu_notifications_enabled ? "enabled" : "disabled");
 }
 
+static void capture_status_notify_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(capture_status_notify_work,
+                               capture_status_notify_work_handler);
+
+static void capture_status_ccc_changed(const struct bt_gatt_attr *attr,
+                                       uint16_t value)
+{
+    ARG_UNUSED(attr);
+    capture_status_notifications_enabled = value == BT_GATT_CCC_NOTIFY;
+    LOG_INF("Capture status notifications %s",
+            capture_status_notifications_enabled ? "enabled" : "disabled");
+    if (capture_status_notifications_enabled) {
+        (void)k_work_reschedule(&capture_status_notify_work, K_NO_WAIT);
+    }
+}
+
 static ssize_t read_status(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                            void *buf, uint16_t len, uint16_t offset)
 {
     return bt_gatt_attr_read(conn, attr, buf, len, offset,
                              &status_value, sizeof(status_value));
+}
+
+static ssize_t read_capture_status(struct bt_conn *conn,
+                                   const struct bt_gatt_attr *attr,
+                                   void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset,
+                             capture_status_value,
+                             sizeof(capture_status_value));
 }
 
 static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -93,12 +136,30 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
     ARG_UNUSED(attr);
     ARG_UNUSED(flags);
 
-    if (offset != 0U || len != 1U) {
+    if (offset != 0U || (len != 1U && len != 5U)) {
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
     }
 
     uint8_t command = ((const uint8_t *)buf)[0];
+    if (command == CONTROL_ACK_FRAME) {
+        if (len != 5U) {
+            return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+        }
+        if (frame_ack_callback != NULL) {
+            frame_ack_callback(sys_get_le32(&((const uint8_t *)buf)[1]));
+        }
+        return len;
+    }
+    if (len != 1U) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
     if (command == CONTROL_KEEPALIVE) {
+        return len;
+    }
+    if (command == CONTROL_RESEND_LAST_IMAGE) {
+        if (resend_request_callback != NULL) {
+            resend_request_callback();
+        }
         return len;
     }
     if (command > FING_MODE_STREAM) {
@@ -129,7 +190,12 @@ BT_GATT_SERVICE_DEFINE(fing_service,
     BT_GATT_CCC(status_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
     BT_GATT_CHARACTERISTIC(BT_UUID_IMU_DATA,
         BT_GATT_CHRC_NOTIFY, 0, NULL, NULL, &imu_value),
-    BT_GATT_CCC(imu_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
+    BT_GATT_CCC(imu_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CHARACTERISTIC(BT_UUID_CAPTURE_STATUS,
+        BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+        BT_GATT_PERM_READ, read_capture_status, NULL, capture_status_value),
+    BT_GATT_CCC(capture_status_ccc_changed,
+                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
 
 static void status_notify_work_handler(struct k_work *work);
@@ -162,6 +228,27 @@ static void status_notify_work_handler(struct k_work *work)
 
     LOG_WRN("Could not notify mode status %u: %d", status_value, err);
     status_notify_attempts = 0U;
+}
+
+static void capture_status_notify_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (current_connection == NULL || !capture_status_notifications_enabled) {
+        return;
+    }
+
+    int err = bt_gatt_notify(current_connection,
+                             &fing_service.attrs[ATTR_CAPTURE_STATUS_VALUE_INDEX],
+                             capture_status_value,
+                             sizeof(capture_status_value));
+    if (err == -ENOMEM || err == -EAGAIN) {
+        (void)k_work_reschedule(&capture_status_notify_work,
+                                K_MSEC(STATUS_NOTIFY_RETRY_DELAY_MS));
+    } else if (err != 0) {
+        LOG_WRN("Could not notify capture status %u: %d",
+                capture_status_value[1], err);
+    }
 }
 
 static const struct bt_data advertising_data[] = {
@@ -228,12 +315,9 @@ static void connected(struct bt_conn *connection, uint8_t error)
     current_connection = bt_conn_ref(connection);
     struct bt_le_conn_param *parameters = BT_LE_CONN_PARAM(12, 12, 0, 400);
     (void)bt_conn_le_param_update(connection, parameters);
-    const struct bt_conn_le_phy_param phy = {
-        .options = BT_CONN_LE_PHY_OPT_NONE,
-        .pref_tx_phy = BT_GAP_LE_PHY_2M,
-        .pref_rx_phy = BT_GAP_LE_PHY_2M,
-    };
-    (void)bt_conn_le_phy_update(connection, &phy);
+    /* Start on the longer-range 1M PHY. The mode manager requests 2M only
+     * for the low-volume IMU stream; image capture intentionally stays 1M. */
+    ble_set_preferred_phy(FING_MODE_IDLE);
     LOG_INF("Phone connected");
 }
 
@@ -244,8 +328,10 @@ static void disconnected(struct bt_conn *connection, uint8_t reason)
     image_notifications_enabled = false;
     status_notifications_enabled = false;
     imu_notifications_enabled = false;
+    capture_status_notifications_enabled = false;
     control_requested_mode = FING_MODE_IDLE;
     (void)k_work_cancel_delayable(&status_notify_work);
+    (void)k_work_cancel_delayable(&capture_status_notify_work);
     if (current_connection != NULL) {
         bt_conn_unref(current_connection);
         current_connection = NULL;
@@ -261,9 +347,13 @@ BT_CONN_CB_DEFINE(connection_callbacks) = {
     .disconnected = disconnected,
 };
 
-int ble_init(ble_mode_request_callback_t callback)
+int ble_init(ble_mode_request_callback_t callback,
+             ble_resend_request_callback_t resend_callback,
+             ble_frame_ack_callback_t ack_callback)
 {
     mode_request_callback = callback;
+    resend_request_callback = resend_callback;
+    frame_ack_callback = ack_callback;
     int err = bt_enable(NULL);
     if (err != 0) {
         return err;
@@ -280,6 +370,61 @@ void ble_set_active_mode(enum fing_mode mode)
     status_value = (uint8_t)mode;
     status_notify_attempts = 0U;
     (void)k_work_reschedule(&status_notify_work, K_NO_WAIT);
+}
+
+void ble_set_preferred_phy(enum fing_mode mode)
+{
+    if (current_connection == NULL) {
+        return;
+    }
+
+    uint8_t phy = mode == FING_MODE_STREAM ? BT_GAP_LE_PHY_2M
+                                           : BT_GAP_LE_PHY_1M;
+    const struct bt_conn_le_phy_param parameters = {
+        .options = BT_CONN_LE_PHY_OPT_NONE,
+        .pref_tx_phy = phy,
+        .pref_rx_phy = phy,
+    };
+    int err = bt_conn_le_phy_update(current_connection, &parameters);
+    if (err != 0) {
+        LOG_WRN("Could not request %s PHY: %d",
+                phy == BT_GAP_LE_PHY_2M ? "2M" : "1M", err);
+    } else {
+        LOG_INF("Requested %s PHY for mode %u",
+                phy == BT_GAP_LE_PHY_2M ? "2M" : "1M", mode);
+    }
+}
+
+void ble_publish_capture_status(enum capture_status_event event,
+                                uint32_t attempt_id,
+                                uint16_t distance_mm,
+                                int16_t detail,
+                                uint8_t progress,
+                                uint8_t total)
+{
+    capture_status_value[0] = CAPTURE_STATUS_VERSION;
+    capture_status_value[1] = (uint8_t)event;
+    sys_put_le32(attempt_id, &capture_status_value[2]);
+    sys_put_le32(k_uptime_get_32(), &capture_status_value[6]);
+    sys_put_le16(distance_mm, &capture_status_value[10]);
+    sys_put_le16((uint16_t)detail, &capture_status_value[12]);
+    capture_status_value[14] = progress;
+    capture_status_value[15] = total;
+
+    if (current_connection == NULL || !capture_status_notifications_enabled) {
+        return;
+    }
+
+    int err = bt_gatt_notify(current_connection,
+                             &fing_service.attrs[ATTR_CAPTURE_STATUS_VALUE_INDEX],
+                             capture_status_value,
+                             sizeof(capture_status_value));
+    if (err == -ENOMEM || err == -EAGAIN) {
+        (void)k_work_reschedule(&capture_status_notify_work,
+                                K_MSEC(STATUS_NOTIFY_RETRY_DELAY_MS));
+    } else if (err != 0) {
+        LOG_WRN("Could not publish capture status %u: %d", event, err);
+    }
 }
 
 enum fing_mode ble_get_active_mode(void)
@@ -333,6 +478,9 @@ int ble_send_frame(const uint8_t *frame, size_t length,
     if (!ble_can_send_frame()) {
         return -ENOTCONN;
     }
+
+    LOG_INF("Frame %u BLE source timestamp=%u CRC32=0x%08x",
+            frame_id, timestamp_ms, crc32_ieee(frame, length));
 
     sys_put_le32(0x12345678U, &header[0]);
     sys_put_le32(frame_id, &header[4]);

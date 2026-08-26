@@ -9,6 +9,8 @@ final class RingBLEManager: NSObject {
     var lastUnwrappedSampleID: UInt64?
     var connectedPeripheralName: String?
     var errorMessage: String?
+    var latestCaptureStatus: CaptureStatus = .waiting
+    var captureStatusHistory: [CaptureStatus] = []
 
     var onSamplesReceived: (([IMUSample]) -> Void)?
     var onConnectionEvent: ((String, UInt64?) -> Void)?
@@ -20,6 +22,7 @@ final class RingBLEManager: NSObject {
     private var statusCharacteristic: CBCharacteristic?
     private var imageCharacteristic: CBCharacteristic?
     private var imuDataCharacteristic: CBCharacteristic?
+    private var captureStatusCharacteristic: CBCharacteristic?
 
     private let unwrapper = SampleIDUnwrapper()
     private let frameReassembler = CameraFrameReassembler()
@@ -32,6 +35,7 @@ final class RingBLEManager: NSObject {
     private var imageNotificationsReady = false
     private var imuNotificationsReady = false
     private var statusNotificationsReady = false
+    private var captureStatusNotificationsReady = false
     private var lastAdvertisedName: String?
 
     override init() {
@@ -90,6 +94,17 @@ final class RingBLEManager: NSObject {
     func stopStreaming() { requestMode(.idle) }
     func enterCaptureMode() { requestMode(.capture) }
     func enterIdleMode() { requestMode(.idle) }
+    func resendLastImage() { writeCommand(BLEConstants.commandResendLastImage) }
+    func acknowledgeFrame(_ frameID: UInt32) {
+        var data = Data([BLEConstants.commandAcknowledgeFrame])
+        data.append(contentsOf: [
+            UInt8(truncatingIfNeeded: frameID),
+            UInt8(truncatingIfNeeded: frameID >> 8),
+            UInt8(truncatingIfNeeded: frameID >> 16),
+            UInt8(truncatingIfNeeded: frameID >> 24),
+        ])
+        writeCommand(data)
+    }
 
     func requestMode(_ mode: FirmwareMode) {
         desiredMode = mode
@@ -112,7 +127,8 @@ final class RingBLEManager: NSObject {
         // channel is subscribed. Otherwise the first status notification can
         // be lost and the app would correctly reject all incoming payloads.
         if desiredMode != .idle && !statusNotificationsReady { return }
-        if desiredMode == .capture && !imageNotificationsReady { return }
+        if desiredMode == .capture &&
+            (!imageNotificationsReady || !captureStatusNotificationsReady) { return }
         if desiredMode == .stream && !imuNotificationsReady { return }
 
         if desiredMode == .stream && shouldRebaseNextStreamStart {
@@ -132,10 +148,14 @@ final class RingBLEManager: NSObject {
     }
 
     private func writeCommand(_ byte: UInt8) {
+        writeCommand(Data([byte]))
+    }
+
+    private func writeCommand(_ data: Data) {
         guard let peripheral, let commandCharacteristic else { return }
         // Mode transitions are infrequent and must not be silently dropped,
         // especially while image notifications are using most of the link.
-        peripheral.writeValue(Data([byte]), for: commandCharacteristic, type: .withResponse)
+        peripheral.writeValue(data, for: commandCharacteristic, type: .withResponse)
     }
 
     private func startKeepalive() {
@@ -210,9 +230,11 @@ extension RingBLEManager: CBCentralManagerDelegate {
         statusCharacteristic = nil
         imageCharacteristic = nil
         imuDataCharacteristic = nil
+        captureStatusCharacteristic = nil
         imageNotificationsReady = false
         imuNotificationsReady = false
         statusNotificationsReady = false
+        captureStatusNotificationsReady = false
         frameReassembler.reset()
         activeMode = .idle
         isStreaming = false
@@ -246,6 +268,7 @@ extension RingBLEManager: CBPeripheralDelegate {
             BLEConstants.imageDataUUID,
             BLEConstants.statusUUID,
             BLEConstants.imuDataUUID,
+            BLEConstants.captureStatusUUID,
             BLEConstants.commandUUID,
         ], for: service)
     }
@@ -267,6 +290,10 @@ extension RingBLEManager: CBPeripheralDelegate {
             case BLEConstants.imuDataUUID:
                 imuDataCharacteristic = characteristic
                 peripheral.setNotifyValue(true, for: characteristic)
+            case BLEConstants.captureStatusUUID:
+                captureStatusCharacteristic = characteristic
+                peripheral.setNotifyValue(true, for: characteristic)
+                peripheral.readValue(for: characteristic)
             default: break
             }
         }
@@ -281,6 +308,11 @@ extension RingBLEManager: CBPeripheralDelegate {
         case BLEConstants.imageDataUUID: imageNotificationsReady = characteristic.isNotifying
         case BLEConstants.imuDataUUID: imuNotificationsReady = characteristic.isNotifying
         case BLEConstants.statusUUID: statusNotificationsReady = characteristic.isNotifying
+        case BLEConstants.captureStatusUUID:
+            captureStatusNotificationsReady = characteristic.isNotifying
+            if characteristic.isNotifying {
+                peripheral.readValue(for: characteristic)
+            }
         default: return
         }
         activateDesiredModeIfReady()
@@ -300,6 +332,18 @@ extension RingBLEManager: CBPeripheralDelegate {
         if characteristic.uuid == BLEConstants.imageDataUUID {
             guard activeMode == .capture else { return }
             if let frame = frameReassembler.process(data) { onFrameReceived?(frame) }
+            return
+        }
+
+        if characteristic.uuid == BLEConstants.captureStatusUUID {
+            guard let status = CaptureStatus(data: data) else { return }
+            latestCaptureStatus = status
+            if captureStatusHistory.first != status {
+                captureStatusHistory.insert(status, at: 0)
+                if captureStatusHistory.count > 12 {
+                    captureStatusHistory.removeLast(captureStatusHistory.count - 12)
+                }
+            }
             return
         }
 

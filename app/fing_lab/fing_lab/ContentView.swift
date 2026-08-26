@@ -39,7 +39,7 @@ struct ContentView: View {
                     } label: {
                         studyRow(
                             title: "Phase 1/2 · Image Capture",
-                            subtitle: "Double flick → ToF → photo preview",
+                            subtitle: "Gesture → ToF → photo preview",
                             systemImage: "camera"
                         )
                     }

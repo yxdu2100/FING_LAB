@@ -116,6 +116,18 @@ final class RecordingCoordinator {
         latestCaptureIndex = captures.first?.captureIndex
         ble.onFrameReceived = { [weak self] frame in
             guard let self else { return }
+            if let existing = self.captures.first(where: {
+                $0.frameID == frame.header.frameID &&
+                    $0.deviceTimestampMs == frame.header.timestampMs
+            }) {
+                // A resend preserves both fields. The MCU frame counter resets
+                // to zero after a reboot, so frameID alone is not globally
+                // unique and must never be used to match persisted captures.
+                self.latestImage = existing.image
+                self.latestCaptureIndex = existing.captureIndex
+                self.ble.acknowledgeFrame(frame.header.frameID)
+                return
+            }
             guard let image = BayerFrameRenderer.makeImage(from: frame.rawBayer) else {
                 self.captureError = "Could not reconstruct the 324 × 244 Bayer frame."
                 return
@@ -126,6 +138,7 @@ final class RecordingCoordinator {
                 self.latestImage = image
                 self.latestCaptureIndex = saved.captureIndex
                 self.captureExportArchive = nil
+                self.ble.acknowledgeFrame(frame.header.frameID)
             } catch {
                 self.captureError = error.localizedDescription
             }

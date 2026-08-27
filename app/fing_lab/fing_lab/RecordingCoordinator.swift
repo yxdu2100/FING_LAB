@@ -96,6 +96,9 @@ final class RecordingCoordinator {
     var captureExportArchive: URL?
 
     init() {
+        ble.deviceSwitchAllowed = { [weak self] in
+            self?.isActiveSession != true
+        }
         ble.onSamplesReceived = { [weak self] samples in
             guard let self else { return }
             self.quality.ingest(samples)
@@ -118,7 +121,8 @@ final class RecordingCoordinator {
             guard let self else { return }
             if let existing = self.captures.first(where: {
                 $0.frameID == frame.header.frameID &&
-                    $0.deviceTimestampMs == frame.header.timestampMs
+                    $0.deviceTimestampMs == frame.header.timestampMs &&
+                    $0.deviceIdentity?.boardID == self.ble.selectedDeviceIdentity?.boardID
             }) {
                 // A resend preserves both fields. The MCU frame counter resets
                 // to zero after a reboot, so frameID alone is not globally
@@ -133,7 +137,11 @@ final class RecordingCoordinator {
                 return
             }
             do {
-                let saved = try self.captureStore.save(frame: frame, image: image)
+                let saved = try self.captureStore.save(
+                    frame: frame,
+                    image: image,
+                    deviceIdentity: self.ble.selectedDeviceIdentity
+                )
                 self.captures.insert(saved, at: 0)
                 self.latestImage = image
                 self.latestCaptureIndex = saved.captureIndex
@@ -159,7 +167,8 @@ final class RecordingCoordinator {
             mode: mode,
             gestureSetVersion: gestureSetVersion,
             imuConfig: imuConfig,
-            notes: notes
+            notes: notes,
+            deviceIdentity: ble.selectedDeviceIdentity
         )
         isActiveSession = true
         ble.setAutoReconnect(true)

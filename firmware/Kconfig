@@ -1,0 +1,20 @@
+mainmenu "Fing Lab firmware"
+
+source "Kconfig.zephyr"
+
+config FING_BOARD_ID
+	string "Stable Fing Lab board identifier"
+	default "fing_20mm"
+	help
+	  Stable identifier stored with every capture and IMU session. Keep this
+	  value unchanged for the lifetime of the physical ring.
+
+config FING_RING_SIZE_MM
+	int "Ring size in millimetres"
+	range 1 255
+	default 20
+
+config FING_FIRMWARE_VERSION
+	string "Fing Lab firmware version"
+	default "0.5.0"
+

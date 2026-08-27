@@ -24,7 +24,8 @@ final class SessionRecorder {
         mode: RecordingMode,
         gestureSetVersion: String = "v1",
         imuConfig: String = "120hz_8g_2000dps",
-        notes: String = ""
+        notes: String = "",
+        deviceIdentity: RingDeviceIdentity? = nil
     ) throws {
         guard !isRecording else { return }
 
@@ -67,7 +68,12 @@ final class SessionRecorder {
             nonmonotonicCount: 0,
             disconnectCount: 0,
             notes: notes,
-            label: mode == .null ? "null" : nil
+            label: mode == .null ? "null" : nil,
+            boardID: deviceIdentity?.boardID,
+            deviceName: deviceIdentity?.advertisedName,
+            ringSizeMm: deviceIdentity?.ringSizeMm,
+            peripheralIdentifier: deviceIdentity?.peripheralIdentifier,
+            firmwareVersion: deviceIdentity?.firmwareVersion
         )
 
         self.sessionID = sessionID

@@ -2,6 +2,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -22,11 +24,13 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define ATTR_STATUS_VALUE_INDEX 7
 #define ATTR_IMU_VALUE_INDEX 10
 #define ATTR_CAPTURE_STATUS_VALUE_INDEX 13
+#define ATTR_DEVICE_INFO_VALUE_INDEX 16
 #define NOTIFY_RETRY_TIMEOUT_MS 5000
 #define NOTIFY_RETRY_SLEEP_US 1000
 #define MAX_PAYLOAD_CHUNK 244U
 #define ADV_RESTART_RETRY_DELAY_MS 50
 #define ADV_RESTART_MAX_ATTEMPTS 20
+#define ADV_FAST_DURATION_SECONDS 30
 #define STATUS_NOTIFY_RETRY_DELAY_MS 20
 #define STATUS_NOTIFY_MAX_ATTEMPTS 50
 #define CONTROL_KEEPALIVE 3U
@@ -53,6 +57,9 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define BT_UUID_CAPTURE_STATUS_VAL \
     BT_UUID_128_ENCODE(0x1234567e, 0x9abc, 0x11ee, 0xbe56, 0x0242ac120002)
 #define BT_UUID_CAPTURE_STATUS BT_UUID_DECLARE_128(BT_UUID_CAPTURE_STATUS_VAL)
+#define BT_UUID_DEVICE_INFO_VAL \
+    BT_UUID_128_ENCODE(0x1234567f, 0x9abc, 0x11ee, 0xbe56, 0x0242ac120002)
+#define BT_UUID_DEVICE_INFO BT_UUID_DECLARE_128(BT_UUID_DEVICE_INFO_VAL)
 
 static struct bt_conn *current_connection;
 static bool image_notifications_enabled;
@@ -68,6 +75,7 @@ static uint8_t capture_status_value[CAPTURE_STATUS_PACKET_LENGTH] = {
     [10] = 0xFFU,
     [11] = 0xFFU,
 };
+static char device_info_value[64];
 static uint8_t advertising_restart_attempts;
 static uint8_t status_notify_attempts;
 static volatile uint8_t control_requested_mode = FING_MODE_IDLE;
@@ -126,6 +134,15 @@ static ssize_t read_capture_status(struct bt_conn *conn,
     return bt_gatt_attr_read(conn, attr, buf, len, offset,
                              capture_status_value,
                              sizeof(capture_status_value));
+}
+
+static ssize_t read_device_info(struct bt_conn *conn,
+                                const struct bt_gatt_attr *attr,
+                                void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset,
+                             device_info_value,
+                             strlen(device_info_value));
 }
 
 static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -195,7 +212,10 @@ BT_GATT_SERVICE_DEFINE(fing_service,
         BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
         BT_GATT_PERM_READ, read_capture_status, NULL, capture_status_value),
     BT_GATT_CCC(capture_status_ccc_changed,
-                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
+                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CHARACTERISTIC(BT_UUID_DEVICE_INFO,
+        BT_GATT_CHRC_READ, BT_GATT_PERM_READ,
+        read_device_info, NULL, device_info_value)
 );
 
 static void status_notify_work_handler(struct k_work *work);
@@ -261,16 +281,57 @@ static const struct bt_data scan_response[] = {
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_FING_SERVICE_VAL),
 };
 
-static int start_advertising(void)
+static const struct bt_le_adv_param slow_advertising_parameters =
+    BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONN,
+                         BT_GAP_ADV_SLOW_INT_MIN,
+                         BT_GAP_ADV_SLOW_INT_MAX,
+                         NULL);
+
+static int start_advertising(bool slow)
 {
-    return bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
+    const struct bt_le_adv_param *parameters = slow
+        ? &slow_advertising_parameters
+        : BT_LE_ADV_CONN_FAST_1;
+    return bt_le_adv_start(parameters,
                            advertising_data, ARRAY_SIZE(advertising_data),
                            scan_response, ARRAY_SIZE(scan_response));
 }
 
 static void restart_advertising_work_handler(struct k_work *work);
+static void schedule_advertising_restart(void);
 static K_WORK_DELAYABLE_DEFINE(restart_advertising_work,
                                restart_advertising_work_handler);
+static void slow_advertising_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(slow_advertising_work,
+                               slow_advertising_work_handler);
+
+static void schedule_slow_advertising(void)
+{
+    (void)k_work_reschedule(&slow_advertising_work,
+                            K_SECONDS(ADV_FAST_DURATION_SECONDS));
+}
+
+static void slow_advertising_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    if (current_connection != NULL) {
+        return;
+    }
+
+    int err = bt_le_adv_stop();
+    if (err != 0 && err != -EALREADY) {
+        LOG_WRN("Could not stop fast advertising: %d", err);
+        return;
+    }
+
+    err = start_advertising(true);
+    if (err == 0 || err == -EALREADY) {
+        LOG_INF("Using low-duty advertising while idle");
+    } else {
+        LOG_WRN("Could not start low-duty advertising: %d", err);
+        schedule_advertising_restart();
+    }
+}
 
 static void restart_advertising_work_handler(struct k_work *work)
 {
@@ -280,10 +341,11 @@ static void restart_advertising_work_handler(struct k_work *work)
         return;
     }
 
-    int err = start_advertising();
+    int err = start_advertising(false);
     if (err == 0 || err == -EALREADY) {
         advertising_restart_attempts = 0U;
-        LOG_INF("Advertising restarted");
+        schedule_slow_advertising();
+        LOG_INF("Fast advertising restarted");
         return;
     }
 
@@ -312,6 +374,7 @@ static void connected(struct bt_conn *connection, uint8_t error)
     }
 
     (void)k_work_cancel_delayable(&restart_advertising_work);
+    (void)k_work_cancel_delayable(&slow_advertising_work);
     current_connection = bt_conn_ref(connection);
     struct bt_le_conn_param *parameters = BT_LE_CONN_PARAM(12, 12, 0, 400);
     (void)bt_conn_le_param_update(connection, parameters);
@@ -354,13 +417,18 @@ int ble_init(ble_mode_request_callback_t callback,
     mode_request_callback = callback;
     resend_request_callback = resend_callback;
     frame_ack_callback = ack_callback;
+    (void)snprintf(device_info_value, sizeof(device_info_value),
+                   "1|%s|%d|%s", CONFIG_FING_BOARD_ID,
+                   CONFIG_FING_RING_SIZE_MM, CONFIG_FING_FIRMWARE_VERSION);
     int err = bt_enable(NULL);
     if (err != 0) {
         return err;
     }
-    err = start_advertising();
+    err = start_advertising(false);
     if (err == 0) {
-        LOG_INF("Advertising as %s", CONFIG_BT_DEVICE_NAME);
+        schedule_slow_advertising();
+        LOG_INF("Advertising as %s (%s)", CONFIG_BT_DEVICE_NAME,
+                device_info_value);
     }
     return err;
 }

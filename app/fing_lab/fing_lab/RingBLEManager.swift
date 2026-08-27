@@ -11,10 +11,33 @@ final class RingBLEManager: NSObject {
     var errorMessage: String?
     var latestCaptureStatus: CaptureStatus = .waiting
     var captureStatusHistory: [CaptureStatus] = []
+    var discoveredDevices: [DiscoveredRingDevice] = []
+    var connectedDeviceIdentity: RingDeviceIdentity?
 
     var onSamplesReceived: (([IMUSample]) -> Void)?
     var onConnectionEvent: ((String, UInt64?) -> Void)?
     var onFrameReceived: ((ReassembledFrame) -> Void)?
+    /// The coordinator uses this to prohibit changing hardware in the middle
+    /// of a Phase 3/4 recording, including while that recording is paused.
+    var deviceSwitchAllowed: (() -> Bool)?
+
+    var selectedDevice: DiscoveredRingDevice? {
+        guard let selectedPeripheralIdentifier else { return nil }
+        return discoveredDevices.first { $0.id == selectedPeripheralIdentifier }
+    }
+
+    var selectedDeviceIdentity: RingDeviceIdentity? {
+        if connectedDeviceIdentity?.peripheralIdentifier == selectedPeripheralIdentifier {
+            return connectedDeviceIdentity
+        }
+        if persistedIdentity?.peripheralIdentifier == selectedPeripheralIdentifier {
+            return persistedIdentity
+        }
+        guard let selected = selectedDevice else { return nil }
+        return fallbackIdentity(for: selected)
+    }
+
+    var hasSelectedDevice: Bool { selectedPeripheralIdentifier != nil }
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -23,23 +46,51 @@ final class RingBLEManager: NSObject {
     private var imageCharacteristic: CBCharacteristic?
     private var imuDataCharacteristic: CBCharacteristic?
     private var captureStatusCharacteristic: CBCharacteristic?
+    private var deviceInfoCharacteristic: CBCharacteristic?
 
     private let unwrapper = SampleIDUnwrapper()
     private let frameReassembler = CameraFrameReassembler()
     private var shouldAutoReconnect = true
     private var keepaliveTimer: Timer?
     private var desiredMode: FirmwareMode = .idle
-    private var lastPeripheralIdentifier: UUID?
     private var disconnectedThisSession = false
     private var shouldRebaseNextStreamStart = false
     private var imageNotificationsReady = false
     private var imuNotificationsReady = false
     private var statusNotificationsReady = false
     private var captureStatusNotificationsReady = false
-    private var lastAdvertisedName: String?
+    private var deviceInfoReady = false
+    private var lastAdvertisedNames: [UUID: String] = [:]
+    private var peripheralsByID: [UUID: CBPeripheral] = [:]
+    private var selectedPeripheralIdentifier: UUID?
+    private var persistedIdentity: RingDeviceIdentity?
+    private var pendingSwitchIdentifier: UUID?
+    private var modeAfterSwitch: FirmwareMode = .idle
+    private var switchTimeoutWorkItem: DispatchWorkItem?
+
+    private enum DefaultsKey {
+        static let selectedPeripheralID = "FingLab.selectedPeripheralID"
+        static let selectedIdentity = "FingLab.selectedDeviceIdentity"
+    }
 
     override init() {
         super.init()
+        let defaults = UserDefaults.standard
+        if let value = defaults.string(forKey: DefaultsKey.selectedPeripheralID) {
+            selectedPeripheralIdentifier = UUID(uuidString: value)
+        }
+        if let data = defaults.data(forKey: DefaultsKey.selectedIdentity) {
+            persistedIdentity = try? JSONDecoder().decode(RingDeviceIdentity.self, from: data)
+        }
+        if let identity = persistedIdentity {
+            discoveredDevices = [DiscoveredRingDevice(
+                id: identity.peripheralIdentifier,
+                advertisedName: identity.advertisedName,
+                rssi: 0,
+                lastSeen: .distantPast,
+                identity: identity
+            )]
+        }
         central = CBCentralManager(
             delegate: self,
             queue: nil,
@@ -50,6 +101,7 @@ final class RingBLEManager: NSObject {
     func setAutoReconnect(_ enabled: Bool) { shouldAutoReconnect = enabled }
 
     func connect() {
+        shouldAutoReconnect = true
         if peripheral?.state == .connected {
             connectionState = .connected
             activateDesiredModeIfReady()
@@ -60,13 +112,34 @@ final class RingBLEManager: NSObject {
 
     func startScanning() {
         guard central.state == .poweredOn else { return }
-        if let connected = central.retrieveConnectedPeripherals(withServices: [BLEConstants.serviceUUID]).first {
+
+        // CoreBluetooth can scan while one peripheral remains connected. This
+        // is necessary for the picker to discover a second ring before the
+        // current ring is safely moved to IDLE and disconnected.
+        if peripheral?.state == .connected {
+            central.scanForPeripherals(
+                withServices: [BLEConstants.serviceUUID],
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+            )
+            return
+        }
+
+        if let selectedPeripheralIdentifier,
+           let connected = central.retrieveConnectedPeripherals(
+               withServices: [BLEConstants.serviceUUID]
+           ).first(where: { $0.identifier == selectedPeripheralIdentifier }) {
+            peripheralsByID[connected.identifier] = connected
             connectToKnownPeripheral(connected)
             return
         }
-        connectionState = .scanning
-        central.scanForPeripherals(withServices: [BLEConstants.serviceUUID],
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+
+        if connectionState != .connecting && connectionState != .connected {
+            connectionState = .scanning
+        }
+        central.scanForPeripherals(
+            withServices: [BLEConstants.serviceUUID],
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
     }
 
     func stopScanning() {
@@ -76,8 +149,49 @@ final class RingBLEManager: NSObject {
         }
     }
 
+    @discardableResult
+    func selectDevice(_ device: DiscoveredRingDevice) -> Bool {
+        if deviceSwitchAllowed?() == false {
+            errorMessage = "Finish or cancel the active IMU session before changing rings."
+            return false
+        }
+
+        selectedPeripheralIdentifier = device.id
+        UserDefaults.standard.set(device.id.uuidString,
+                                  forKey: DefaultsKey.selectedPeripheralID)
+        errorMessage = nil
+        shouldAutoReconnect = true
+
+        if peripheral?.identifier == device.id {
+            activateDesiredModeIfReady()
+            return true
+        }
+
+        guard let current = peripheral, current.state == .connected else {
+            connectSelectedDeviceIfAvailable()
+            return true
+        }
+
+        pendingSwitchIdentifier = device.id
+        modeAfterSwitch = desiredMode
+        desiredMode = .idle
+        stopKeepalive()
+        writeCommand(BLEConstants.commandIdle)
+        if activeMode == .idle {
+            finishPendingSwitch()
+        } else {
+            let timeout = DispatchWorkItem { [weak self] in self?.finishPendingSwitch() }
+            switchTimeoutWorkItem?.cancel()
+            switchTimeoutWorkItem = timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: timeout)
+        }
+        return true
+    }
+
     func disconnect() {
         shouldAutoReconnect = false
+        pendingSwitchIdentifier = nil
+        switchTimeoutWorkItem?.cancel()
         stopKeepalive()
         requestMode(.idle)
         if let peripheral { central.cancelPeripheralConnection(peripheral) }
@@ -95,6 +209,7 @@ final class RingBLEManager: NSObject {
     func enterCaptureMode() { requestMode(.capture) }
     func enterIdleMode() { requestMode(.idle) }
     func resendLastImage() { writeCommand(BLEConstants.commandResendLastImage) }
+
     func acknowledgeFrame(_ frameID: UInt32) {
         var data = Data([BLEConstants.commandAcknowledgeFrame])
         data.append(contentsOf: [
@@ -107,34 +222,67 @@ final class RingBLEManager: NSObject {
     }
 
     func requestMode(_ mode: FirmwareMode) {
+        if pendingSwitchIdentifier != nil {
+            modeAfterSwitch = mode
+            return
+        }
         desiredMode = mode
         if mode != .stream { stopKeepalive() }
         activateDesiredModeIfReady()
     }
 
+    private func connectSelectedDeviceIfAvailable() {
+        guard let selectedPeripheralIdentifier else {
+            startScanning()
+            return
+        }
+        if let found = peripheralsByID[selectedPeripheralIdentifier] {
+            connectToKnownPeripheral(found)
+        } else {
+            startScanning()
+        }
+    }
+
     private func connectToKnownPeripheral(_ found: CBPeripheral) {
+        guard found.identifier == selectedPeripheralIdentifier else { return }
         stopScanning()
         peripheral = found
         found.delegate = self
-        lastPeripheralIdentifier = found.identifier
+        resetDiscoveredCharacteristics()
         connectionState = .connecting
         central.connect(found)
     }
 
+    private func finishPendingSwitch() {
+        guard pendingSwitchIdentifier != nil else { return }
+        switchTimeoutWorkItem?.cancel()
+        switchTimeoutWorkItem = nil
+        if let peripheral, peripheral.state != .disconnected {
+            central.cancelPeripheralConnection(peripheral)
+        } else {
+            completePendingSwitchAfterDisconnect()
+        }
+    }
+
+    private func completePendingSwitchAfterDisconnect() {
+        guard let target = pendingSwitchIdentifier else { return }
+        pendingSwitchIdentifier = nil
+        desiredMode = modeAfterSwitch
+        if let found = peripheralsByID[target] {
+            connectToKnownPeripheral(found)
+        } else {
+            startScanning()
+        }
+    }
+
     private func activateDesiredModeIfReady() {
-        guard commandCharacteristic != nil else { return }
-        // Do not switch a data-producing mode until its acknowledgement
-        // channel is subscribed. Otherwise the first status notification can
-        // be lost and the app would correctly reject all incoming payloads.
+        guard commandCharacteristic != nil, deviceInfoReady else { return }
         if desiredMode != .idle && !statusNotificationsReady { return }
         if desiredMode == .capture &&
             (!imageNotificationsReady || !captureStatusNotificationsReady) { return }
         if desiredMode == .stream && !imuNotificationsReady { return }
 
         if desiredMode == .stream && shouldRebaseNextStreamStart {
-            // The firmware restarts its 16-bit sample counter whenever STREAM is
-            // entered. Rebase once after reconnect so the exported IDs remain
-            // monotonic instead of looking like a 65,536-sample jump.
             unwrapper.markFirmwareWillRestart()
             shouldRebaseNextStreamStart = false
         }
@@ -153,8 +301,6 @@ final class RingBLEManager: NSObject {
 
     private func writeCommand(_ data: Data) {
         guard let peripheral, let commandCharacteristic else { return }
-        // Mode transitions are infrequent and must not be silently dropped,
-        // especially while image notifications are using most of the link.
         peripheral.writeValue(data, for: commandCharacteristic, type: .withResponse)
     }
 
@@ -169,6 +315,85 @@ final class RingBLEManager: NSObject {
     private func stopKeepalive() {
         keepaliveTimer?.invalidate()
         keepaliveTimer = nil
+    }
+
+    private func resetDiscoveredCharacteristics() {
+        commandCharacteristic = nil
+        statusCharacteristic = nil
+        imageCharacteristic = nil
+        imuDataCharacteristic = nil
+        captureStatusCharacteristic = nil
+        deviceInfoCharacteristic = nil
+        imageNotificationsReady = false
+        imuNotificationsReady = false
+        statusNotificationsReady = false
+        captureStatusNotificationsReady = false
+        deviceInfoReady = false
+    }
+
+    private func updateDiscoveredDevice(_ device: DiscoveredRingDevice) {
+        if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
+            discoveredDevices[index] = device
+        } else {
+            discoveredDevices.append(device)
+        }
+        discoveredDevices.sort {
+            if $0.id == selectedPeripheralIdentifier { return true }
+            if $1.id == selectedPeripheralIdentifier { return false }
+            return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+        }
+    }
+
+    private func fallbackIdentity(for device: DiscoveredRingDevice) -> RingDeviceIdentity {
+        let size = device.ringSizeLabel.flatMap {
+            Int($0.replacingOccurrences(of: " mm", with: ""))
+        } ?? 0
+        return RingDeviceIdentity(
+            protocolVersion: 0,
+            boardID: device.advertisedName.lowercased(),
+            ringSizeMm: size,
+            firmwareVersion: "unknown",
+            peripheralIdentifier: device.id,
+            advertisedName: device.advertisedName
+        )
+    }
+
+    private func storeDeviceInfo(_ data: Data, for peripheral: CBPeripheral) {
+        guard let value = String(data: data, encoding: .utf8) else { return }
+        let fields = value.split(separator: "|", omittingEmptySubsequences: false)
+        guard fields.count == 4,
+              let protocolVersion = Int(fields[0]),
+              let ringSize = Int(fields[2]) else {
+            errorMessage = "The selected ring returned invalid device information."
+            return
+        }
+        let advertisedName = lastAdvertisedNames[peripheral.identifier]
+            ?? peripheral.name ?? String(fields[1]).uppercased()
+        let identity = RingDeviceIdentity(
+            protocolVersion: protocolVersion,
+            boardID: String(fields[1]),
+            ringSizeMm: ringSize,
+            firmwareVersion: String(fields[3]),
+            peripheralIdentifier: peripheral.identifier,
+            advertisedName: advertisedName
+        )
+        connectedDeviceIdentity = identity
+        connectedPeripheralName = identity.displayName
+        persistedIdentity = identity
+        if let encoded = try? JSONEncoder().encode(identity) {
+            UserDefaults.standard.set(encoded, forKey: DefaultsKey.selectedIdentity)
+        }
+
+        let previous = discoveredDevices.first { $0.id == peripheral.identifier }
+        updateDiscoveredDevice(DiscoveredRingDevice(
+            id: peripheral.identifier,
+            advertisedName: advertisedName,
+            rssi: previous?.rssi ?? 0,
+            lastSeen: previous?.lastSeen ?? Date(),
+            identity: identity
+        ))
+        deviceInfoReady = true
+        activateDesiredModeIfReady()
     }
 }
 
@@ -188,11 +413,14 @@ extension RingBLEManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        guard let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first else { return }
+        guard let selectedPeripheralIdentifier,
+              let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?
+                .first(where: { $0.identifier == selectedPeripheralIdentifier })
+        else { return }
+        peripheralsByID[restored.identifier] = restored
         if restored.state == .connected {
             peripheral = restored
             restored.delegate = self
-            lastPeripheralIdentifier = restored.identifier
             connectionState = .connecting
             restored.discoverServices([BLEConstants.serviceUUID])
         } else {
@@ -204,14 +432,34 @@ extension RingBLEManager: CBCentralManagerDelegate {
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let liveName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = liveName ?? peripheral.name ?? ""
-        guard name == BLEConstants.deviceName || name.hasPrefix(BLEConstants.deviceName) else { return }
-        lastAdvertisedName = liveName
-        connectToKnownPeripheral(peripheral)
+        guard name.hasPrefix(BLEConstants.deviceNamePrefix) else { return }
+        lastAdvertisedNames[peripheral.identifier] = name
+        peripheralsByID[peripheral.identifier] = peripheral
+        let existingIdentity = discoveredDevices.first {
+            $0.id == peripheral.identifier
+        }?.identity
+        updateDiscoveredDevice(DiscoveredRingDevice(
+            id: peripheral.identifier,
+            advertisedName: name,
+            rssi: RSSI.intValue,
+            lastSeen: Date(),
+            identity: existingIdentity
+        ))
+
+        if peripheral.identifier == selectedPeripheralIdentifier,
+           self.peripheral?.state != .connected,
+           connectionState != .connecting {
+            connectToKnownPeripheral(peripheral)
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard peripheral.identifier == selectedPeripheralIdentifier else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         connectionState = .connected
-        connectedPeripheralName = lastAdvertisedName ?? peripheral.name
+        connectedPeripheralName = lastAdvertisedNames[peripheral.identifier] ?? peripheral.name
         peripheral.discoverServices([BLEConstants.serviceUUID])
         if disconnectedThisSession { onConnectionEvent?("reconnect", lastUnwrappedSampleID) }
     }
@@ -226,27 +474,24 @@ extension RingBLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
         self.peripheral = nil
-        commandCharacteristic = nil
-        statusCharacteristic = nil
-        imageCharacteristic = nil
-        imuDataCharacteristic = nil
-        captureStatusCharacteristic = nil
-        imageNotificationsReady = false
-        imuNotificationsReady = false
-        statusNotificationsReady = false
-        captureStatusNotificationsReady = false
+        resetDiscoveredCharacteristics()
         frameReassembler.reset()
         activeMode = .idle
         isStreaming = false
+        connectedDeviceIdentity = nil
         stopKeepalive()
         connectionState = .disconnected
         disconnectedThisSession = true
-        shouldRebaseNextStreamStart = desiredMode == .stream
+        shouldRebaseNextStreamStart = desiredMode == .stream || modeAfterSwitch == .stream
         onConnectionEvent?("disconnect", lastUnwrappedSampleID)
 
-        if shouldAutoReconnect {
+        if pendingSwitchIdentifier != nil {
+            completePendingSwitchAfterDisconnect()
+        } else if shouldAutoReconnect {
             connectionState = .reconnecting
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startScanning() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.startScanning()
+            }
         }
     }
 }
@@ -269,6 +514,7 @@ extension RingBLEManager: CBPeripheralDelegate {
             BLEConstants.statusUUID,
             BLEConstants.imuDataUUID,
             BLEConstants.captureStatusUUID,
+            BLEConstants.deviceInfoUUID,
             BLEConstants.commandUUID,
         ], for: service)
     }
@@ -294,8 +540,14 @@ extension RingBLEManager: CBPeripheralDelegate {
                 captureStatusCharacteristic = characteristic
                 peripheral.setNotifyValue(true, for: characteristic)
                 peripheral.readValue(for: characteristic)
+            case BLEConstants.deviceInfoUUID:
+                deviceInfoCharacteristic = characteristic
+                peripheral.readValue(for: characteristic)
             default: break
             }
+        }
+        if deviceInfoCharacteristic == nil {
+            errorMessage = "This ring firmware does not expose a stable device identity."
         }
         activateDesiredModeIfReady()
     }
@@ -322,10 +574,18 @@ extension RingBLEManager: CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
 
+        if characteristic.uuid == BLEConstants.deviceInfoUUID {
+            storeDeviceInfo(data, for: peripheral)
+            return
+        }
+
         if characteristic.uuid == BLEConstants.statusUUID {
             guard data.count == 1, let mode = FirmwareMode(rawValue: data[0]) else { return }
             activeMode = mode
             isStreaming = mode == .stream
+            if mode == .idle && pendingSwitchIdentifier != nil {
+                finishPendingSwitch()
+            }
             return
         }
 

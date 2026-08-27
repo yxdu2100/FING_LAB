@@ -4,6 +4,7 @@ struct ContentView: View {
     @Environment(RecordingCoordinator.self) private var coordinator
     @Environment(AppSettings.self) private var settings
     @State private var showSettings = false
+    @State private var showDevicePicker = false
 
     var body: some View {
         @Bindable var settings = settings
@@ -27,9 +28,28 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    Button("Connect / Reconnect") {
-                        coordinator.ble.setAutoReconnect(true)
-                        coordinator.ble.connect()
+                    if let identity = coordinator.ble.selectedDeviceIdentity {
+                        LabeledContent("Selected", value: identity.displayName)
+                        LabeledContent("Hardware") {
+                            Text(identity.ringSizeMm > 0
+                                 ? "\(identity.ringSizeMm) mm · FW \(identity.firmwareVersion)"
+                                 : "Identity pending")
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text("Choose a ring before starting a study phase.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    HStack {
+                        Button("Choose Ring") { showDevicePicker = true }
+                            .disabled(coordinator.isActiveSession)
+                        Spacer()
+                        Button("Reconnect") {
+                            coordinator.ble.setAutoReconnect(true)
+                            coordinator.ble.connect()
+                        }
+                        .disabled(!coordinator.ble.hasSelectedDevice)
                     }
                 }
 
@@ -43,6 +63,7 @@ struct ContentView: View {
                             systemImage: "camera"
                         )
                     }
+                    .disabled(!coordinator.ble.hasSelectedDevice)
 
                     NavigationLink {
                         GuidedSessionView()
@@ -53,7 +74,7 @@ struct ContentView: View {
                             systemImage: "hand.tap"
                         )
                     }
-                    .disabled(participantIDIsEmpty)
+                    .disabled(participantIDIsEmpty || !coordinator.ble.hasSelectedDevice)
 
                     NavigationLink {
                         EverydayTasksView()
@@ -64,7 +85,7 @@ struct ContentView: View {
                             systemImage: "figure.walk"
                         )
                     }
-                    .disabled(participantIDIsEmpty)
+                    .disabled(participantIDIsEmpty || !coordinator.ble.hasSelectedDevice)
                 }
 
                 if participantIDIsEmpty {
@@ -92,12 +113,19 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .sheet(isPresented: $showDevicePicker) { DevicePickerView() }
+            .alert("Bluetooth", isPresented: Binding(
+                get: { coordinator.ble.errorMessage != nil },
+                set: { if !$0 { coordinator.ble.errorMessage = nil } }
+            )) {
+                Button("OK") { coordinator.ble.errorMessage = nil }
+            } message: {
+                Text(coordinator.ble.errorMessage ?? "Unknown Bluetooth error")
+            }
             .onAppear {
                 coordinator.sessionStore.refresh()
                 coordinator.ble.setAutoReconnect(true)
-                if !coordinator.ble.connectionState.isConnected {
-                    coordinator.ble.connect()
-                }
+                coordinator.ble.startScanning()
             }
         }
     }

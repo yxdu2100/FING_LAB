@@ -22,10 +22,12 @@ int main(void)
         return err;
     }
 
-    /* Preserve the proven Phase 1/2 behavior at boot. The iOS app can switch
-     * to the isolated streaming profile before Phase 3 or Phase 4. */
-    mode_manager_request(FING_MODE_CAPTURE);
-    LOG_INF("Ready: app-selectable CAPTURE and 120 Hz STREAM modes");
+    /* Every ring boots in the common low-power IDLE state. The selected app
+     * explicitly enters CAPTURE or STREAM after all matching notification
+     * channels have been subscribed. */
+    LOG_INF("Ready in IDLE: board=%s ring=%d mm firmware=%s",
+            CONFIG_FING_BOARD_ID, CONFIG_FING_RING_SIZE_MM,
+            CONFIG_FING_FIRMWARE_VERSION);
     mode_manager_run();
     return 0;
 }

@@ -13,6 +13,7 @@ enum BLEConstants {
     static let statusUUID = CBUUID(string: "1234567C-9ABC-11EE-BE56-0242AC120002")
     static let imuDataUUID = CBUUID(string: "1234567D-9ABC-11EE-BE56-0242AC120002")
     static let captureStatusUUID = CBUUID(string: "1234567E-9ABC-11EE-BE56-0242AC120002")
+    static let deviceInfoUUID = CBUUID(string: "1234567F-9ABC-11EE-BE56-0242AC120002")
     static let commandUUID = CBUUID(string: "12345678-1234-5678-1234-56789ABCDE01")
 
     static let commandIdle = FirmwareMode.idle.rawValue
@@ -26,7 +27,7 @@ enum BLEConstants {
     static let maxSamplesPerPacket = 7
     static let inferencePayloadLength = 10
     static let inferencePayloadVersion: UInt8 = 1
-    static let deviceName = "FING_LAB"
+    static let deviceNamePrefix = "FING_"
     static let keepaliveInterval: TimeInterval = 2.0
     static let restoreIdentifier = "com.yuxin.finglab.ble"
 }

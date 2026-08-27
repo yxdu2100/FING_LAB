@@ -13,6 +13,7 @@ struct SavedCapture: Identifiable {
     let rawURL: URL
     let metadataURL: URL
     let image: UIImage
+    let deviceIdentity: RingDeviceIdentity?
 
     var exportURLs: [URL] { [imageURL, rawURL, metadataURL] }
 }
@@ -30,6 +31,7 @@ private struct CaptureMetadata: Codable {
     let bayerPattern: String
     let rawFile: String
     let imageFile: String
+    let deviceIdentity: RingDeviceIdentity?
 }
 
 final class CaptureStore {
@@ -63,7 +65,8 @@ final class CaptureStore {
         )
     }
 
-    func save(frame: ReassembledFrame, image: UIImage) throws -> SavedCapture {
+    func save(frame: ReassembledFrame, image: UIImage,
+              deviceIdentity: RingDeviceIdentity? = nil) throws -> SavedCapture {
         let receivedAt = Date()
         let captureIndex = nextCaptureIndex
         let id = String(format: "capture_%010llu_%lld", captureIndex,
@@ -85,7 +88,8 @@ final class CaptureStore {
             outputHeight: configuration.outputHeight,
             bayerPattern: "BGGR, bottom-left stream origin",
             rawFile: rawURL.lastPathComponent,
-            imageFile: imageURL.lastPathComponent
+            imageFile: imageURL.lastPathComponent,
+            deviceIdentity: deviceIdentity
         )
 
         try png.write(to: imageURL, options: .atomic)
@@ -108,7 +112,8 @@ final class CaptureStore {
         return SavedCapture(id: id, captureIndex: captureIndex, frameID: metadata.frameID,
                             deviceTimestampMs: metadata.deviceTimestampMs,
                             receivedAt: receivedAt, imageURL: imageURL,
-                            rawURL: rawURL, metadataURL: metadataURL, image: image)
+                            rawURL: rawURL, metadataURL: metadataURL, image: image,
+                            deviceIdentity: deviceIdentity)
     }
 
     func load() -> [SavedCapture] {
@@ -158,7 +163,8 @@ final class CaptureStore {
                     outputHeight: metadata.outputHeight,
                     bayerPattern: metadata.bayerPattern,
                     rawFile: metadata.rawFile,
-                    imageFile: metadata.imageFile
+                    imageFile: metadata.imageFile,
+                    deviceIdentity: metadata.deviceIdentity
                 )
                 try? encoder.encode(migratedMetadata).write(to: url, options: .atomic)
             }
@@ -174,7 +180,8 @@ final class CaptureStore {
                 imageURL: imageURL,
                 rawURL: rawURL,
                 metadataURL: url,
-                image: image
+                image: image,
+                deviceIdentity: metadata.deviceIdentity
             )
         }
 

@@ -61,6 +61,13 @@ struct SessionMeta: Codable {
     var disconnectCount: Int
     var notes: String
     var label: String?
+    /// Optional fields preserve decoding of sessions recorded before
+    /// multi-device support was added.
+    var boardID: String?
+    var deviceName: String?
+    var ringSizeMm: Int?
+    var peripheralIdentifier: UUID?
+    var firmwareVersion: String?
 
     var dropPercentage: Double {
         let total = totalSamples + droppedSamples

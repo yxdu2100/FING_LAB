@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppSettings.self) private var settings
+    @Environment(RecordingCoordinator.self) private var coordinator
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -51,6 +52,20 @@ struct SettingsView: View {
                     Toggle("Re-don ring between sessions", isOn: $settings.showRedonPrompt)
                 }
 
+                Section("Captured Images") {
+                    Picker("Image rotation", selection: rotationBinding) {
+                        ForEach(CaptureImageRotation.allCases) { rotation in
+                            Text(rotation.label).tag(rotation)
+                        }
+                    }
+                    if coordinator.isReprocessingCaptures {
+                        ProgressView("Updating saved PNG files…")
+                    }
+                    Text("The selected rotation is applied to the current preview, every saved PNG, and all future captures. Raw Bayer files are never modified.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("BLE Protocol") {
                     LabeledContent("Service", value: "…120002")
                     LabeledContent("Mode control", value: "0=idle, 1=capture, 2=IMU")
@@ -61,12 +76,32 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .alert("Image Processing", isPresented: Binding(
+                get: { coordinator.captureError != nil },
+                set: { if !$0 { coordinator.captureError = nil } }
+            )) {
+                Button("OK") { coordinator.captureError = nil }
+            } message: {
+                Text(coordinator.captureError ?? "Unknown image processing error")
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
+    }
+
+    private var rotationBinding: Binding<CaptureImageRotation> {
+        Binding(
+            get: { settings.captureImageRotation },
+            set: { rotation in
+                guard rotation != settings.captureImageRotation else { return }
+                if coordinator.applyCaptureRotation(rotation) {
+                    settings.captureImageRotation = rotation
+                }
+            }
+        )
     }
 
     private func gestureBinding(_ id: String) -> Binding<Bool> {

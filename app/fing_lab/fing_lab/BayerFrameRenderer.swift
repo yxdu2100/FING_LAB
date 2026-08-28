@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import Foundation
 import UIKit
 
@@ -7,9 +8,11 @@ enum BayerFrameRenderer {
     private static let redGain = 1.082
     private static let greenGain = 1.0
     private static let blueGain = 1.692
+    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     static func makeImage(from payload: Data,
-                          configuration: CameraConfiguration = .current) -> UIImage? {
+                          configuration: CameraConfiguration = .current,
+                          rotation: CaptureImageRotation = CaptureRenderSettings.currentRotation) -> UIImage? {
         guard payload.count == configuration.payloadLength else { return nil }
 
         let width = configuration.outputWidth
@@ -88,10 +91,30 @@ enum BayerFrameRenderer {
             intent: .defaultIntent
         ) else { return nil }
 
-        return UIImage(cgImage: cgImage)
+        guard let rotated = rotatePixels(cgImage, by: rotation) else { return nil }
+        return UIImage(cgImage: rotated)
     }
 
     private static func corrected(_ value: Int, gain: Double) -> UInt8 {
-        UInt8(clamping: Int((Double(value) * gain).rounded()))
+        let normalized = min(max(Double(value) * gain / 255.0, 0.0), 1.0)
+        let gammaCorrected = pow(normalized, CaptureRenderSettings.gamma)
+        return UInt8(clamping: Int((gammaCorrected * 255.0).rounded()))
+    }
+
+    /// Materialize rotation into the PNG pixels instead of using UIImage's
+    /// orientation flag. This keeps thumbnails, zoom view, and exports equal.
+    private static func rotatePixels(_ image: CGImage,
+                                     by rotation: CaptureImageRotation) -> CGImage? {
+        guard rotation != .degrees0 else { return image }
+
+        let radians = CGFloat(rotation.rawValue) * .pi / 180.0
+        let rotated = CIImage(cgImage: image)
+            .transformed(by: CGAffineTransform(rotationAngle: -radians))
+        let extent = rotated.extent.integral
+        let normalized = rotated.transformed(by: CGAffineTransform(
+            translationX: -extent.origin.x,
+            y: -extent.origin.y
+        ))
+        return ciContext.createCGImage(normalized, from: normalized.extent)
     }
 }

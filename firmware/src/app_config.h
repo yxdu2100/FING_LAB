@@ -5,6 +5,9 @@
 #define TOF_MAX_DISTANCE_MM 500U
 #define CAMERA_CAPTURE_MAX_ATTEMPTS 5
 #define CAMERA_AE_DISCARD_FRAMES 3U
+/* HM01B0 AE target mean. The former 0x3C target was consistently dark;
+ * 0x44 is a conservative +13% target that preserves highlight headroom. */
+#define CAMERA_AE_TARGET_MEAN 0x44U
 
 /* Capture gesture configuration.
  *

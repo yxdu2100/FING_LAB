@@ -26,12 +26,15 @@ private struct CaptureMetadata: Codable {
     let receivedAt: Date
     let rawWidth: Int
     let rawHeight: Int
-    let outputWidth: Int
-    let outputHeight: Int
+    var outputWidth: Int
+    var outputHeight: Int
     let bayerPattern: String
     let rawFile: String
     let imageFile: String
     let deviceIdentity: RingDeviceIdentity?
+    var rotationDegrees: Int?
+    var renderGamma: Double?
+    var renderProfileVersion: Int?
 }
 
 final class CaptureStore {
@@ -84,12 +87,15 @@ final class CaptureStore {
             receivedAt: receivedAt,
             rawWidth: configuration.rawWidth,
             rawHeight: configuration.rawHeight,
-            outputWidth: configuration.outputWidth,
-            outputHeight: configuration.outputHeight,
+            outputWidth: Int(image.size.width.rounded()),
+            outputHeight: Int(image.size.height.rounded()),
             bayerPattern: "BGGR, bottom-left stream origin",
             rawFile: rawURL.lastPathComponent,
             imageFile: imageURL.lastPathComponent,
-            deviceIdentity: deviceIdentity
+            deviceIdentity: deviceIdentity,
+            rotationDegrees: CaptureRenderSettings.currentRotation.rawValue,
+            renderGamma: CaptureRenderSettings.gamma,
+            renderProfileVersion: CaptureRenderSettings.profileVersion
         )
 
         try png.write(to: imageURL, options: .atomic)
@@ -164,7 +170,10 @@ final class CaptureStore {
                     bayerPattern: metadata.bayerPattern,
                     rawFile: metadata.rawFile,
                     imageFile: metadata.imageFile,
-                    deviceIdentity: metadata.deviceIdentity
+                    deviceIdentity: metadata.deviceIdentity,
+                    rotationDegrees: metadata.rotationDegrees,
+                    renderGamma: metadata.renderGamma,
+                    renderProfileVersion: metadata.renderProfileVersion
                 )
                 try? encoder.encode(migratedMetadata).write(to: url, options: .atomic)
             }
@@ -186,6 +195,54 @@ final class CaptureStore {
         }
 
         return captures.sorted { $0.receivedAt > $1.receivedAt }
+    }
+
+    /// Rebuild PNGs from their immutable Bayer files. Re-rendering from raw
+    /// avoids cumulative rotation or brightness changes and keeps exports
+    /// deterministic when the global orientation changes repeatedly.
+    func rerenderAll(rotation: CaptureImageRotation,
+                     onlyIfNeeded: Bool = false) throws -> [SavedCapture] {
+        let metadataURLs = (try? fileManager.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: nil
+        ))?.filter { $0.pathExtension == "json" } ?? []
+
+        for metadataURL in metadataURLs {
+            let metadataData = try Data(contentsOf: metadataURL)
+            var metadata = try decoder.decode(CaptureMetadata.self, from: metadataData)
+            let alreadyCurrent = metadata.rotationDegrees == rotation.rawValue &&
+                metadata.renderGamma == CaptureRenderSettings.gamma &&
+                metadata.renderProfileVersion == CaptureRenderSettings.profileVersion
+            if onlyIfNeeded && alreadyCurrent { continue }
+
+            let rawURL = root.appendingPathComponent(metadata.rawFile)
+            let imageURL = root.appendingPathComponent(metadata.imageFile)
+            let raw = try Data(contentsOf: rawURL)
+            guard let image = BayerFrameRenderer.makeImage(from: raw, rotation: rotation),
+                  let png = image.pngData() else {
+                throw StoreError.imageEncodingFailed
+            }
+
+            metadata.rotationDegrees = rotation.rawValue
+            metadata.renderGamma = CaptureRenderSettings.gamma
+            metadata.renderProfileVersion = CaptureRenderSettings.profileVersion
+            metadata.outputWidth = Int(image.size.width.rounded())
+            metadata.outputHeight = Int(image.size.height.rounded())
+
+            // Keep a rollback copy so a metadata failure cannot leave the PNG
+            // and JSON describing different render settings.
+            let previousPNG = try? Data(contentsOf: imageURL)
+            try png.write(to: imageURL, options: .atomic)
+            do {
+                try encoder.encode(metadata).write(to: metadataURL, options: .atomic)
+            } catch {
+                if let previousPNG {
+                    try? previousPNG.write(to: imageURL, options: .atomic)
+                }
+                throw error
+            }
+        }
+
+        return load()
     }
 
     func delete(_ capture: SavedCapture) throws {

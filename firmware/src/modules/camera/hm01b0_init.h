@@ -1,6 +1,7 @@
 #ifndef HM01B0_INIT_H
 #define HM01B0_INIT_H
 #include <stdint.h>
+#include "app_config.h"
 
 struct sensor_reg {
 	uint16_t reg;
@@ -53,7 +54,7 @@ struct sensor_reg hm01b0_324x244[] = {
     {0x2017,0x00},
     {0x2018,0x9B},
     {0x2100,0x01},
-    {0x2101,0x3C},
+    {0x2101,CAMERA_AE_TARGET_MEAN},
     {0x2102,0x0A},
     {0x2103,0x03},
     {0x2104,0x05},

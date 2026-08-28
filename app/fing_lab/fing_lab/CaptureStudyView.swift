@@ -3,6 +3,7 @@ import SwiftUI
 struct CaptureStudyView: View {
     @Environment(RecordingCoordinator.self) private var coordinator
     @State private var confirmDeleteAll = false
+    @State private var inspectedImage: CaptureImageViewerItem?
 
     var body: some View {
         ScrollView {
@@ -43,6 +44,9 @@ struct CaptureStudyView: View {
         ) {
             Button("Delete All", role: .destructive) { coordinator.deleteAllCaptures() }
             Button("Cancel", role: .cancel) {}
+        }
+        .fullScreenCover(item: $inspectedImage) { item in
+            CaptureImageViewer(item: item)
         }
     }
 
@@ -141,6 +145,26 @@ struct CaptureStudyView: View {
                         .resizable()
                         .interpolation(.none)
                         .scaledToFit()
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            inspectedImage = CaptureImageViewerItem(
+                                id: "latest-\(coordinator.latestCaptureIndex ?? 0)",
+                                image: image,
+                                title: coordinator.latestCaptureIndex.map { "Frame \($0)" }
+                                    ?? "Latest Capture"
+                            )
+                        }
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .padding(9)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .padding(8)
+                        }
+                    }
+                    .allowsHitTesting(false)
                 } else {
                     ContentUnavailableView(
                         "Waiting for a photo",
@@ -235,11 +259,18 @@ struct CaptureStudyView: View {
                     Image(uiImage: capture.image)
                         .resizable()
                         .interpolation(.none)
-                        .scaledToFill()
+                        .scaledToFit()
                         .frame(width: 120, height: 90)
-                        .clipped()
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            inspectedImage = CaptureImageViewerItem(
+                                id: capture.id,
+                                image: capture.image,
+                                title: "Frame \(capture.captureIndex)"
+                            )
+                        }
                     VStack(alignment: .leading, spacing: 5) {
                         Text("Frame \(capture.captureIndex)").font(.headline)
                         Text("Device frame ID \(capture.frameID)")

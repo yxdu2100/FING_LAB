@@ -28,6 +28,14 @@ final class AppSettings {
     var enabledGestureIDs: [String] {
         didSet { UserDefaults.standard.set(enabledGestureIDs, forKey: Keys.enabledGestureIDs) }
     }
+    var captureImageRotation: CaptureImageRotation {
+        didSet {
+            UserDefaults.standard.set(
+                captureImageRotation.rawValue,
+                forKey: CaptureRenderSettings.rotationDefaultsKey
+            )
+        }
+    }
 
     var enabledGestures: [GestureDefinition] {
         let defaults = GestureDefinition.defaults
@@ -73,6 +81,7 @@ final class AppSettings {
             ?? GestureDefinition.defaults.map(\.id)
         // Migrate installations of RingCollector that stored the old label.
         enabledGestureIDs = savedGestureIDs.map { $0 == "pinch_hold" ? "hover" : $0 }
+        captureImageRotation = CaptureRenderSettings.currentRotation
     }
 }
 
@@ -94,6 +103,7 @@ final class RecordingCoordinator {
     var captures: [SavedCapture] = []
     var captureError: String?
     var captureExportArchive: URL?
+    var isReprocessingCaptures = false
 
     init() {
         ble.deviceSwitchAllowed = { [weak self] in
@@ -114,7 +124,15 @@ final class RecordingCoordinator {
             }
         }
 
-        captures = captureStore.load()
+        do {
+            captures = try captureStore.rerenderAll(
+                rotation: CaptureRenderSettings.currentRotation,
+                onlyIfNeeded: true
+            )
+        } catch {
+            captures = captureStore.load()
+            captureError = "Saved captures could not be updated to the current render settings: \(error.localizedDescription)"
+        }
         latestImage = captures.first?.image
         latestCaptureIndex = captures.first?.captureIndex
         ble.onFrameReceived = { [weak self] frame in
@@ -220,6 +238,24 @@ final class RecordingCoordinator {
             captureExportArchive = try captureStore.makeExportArchive()
         } catch {
             captureError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func applyCaptureRotation(_ rotation: CaptureImageRotation) -> Bool {
+        guard !isReprocessingCaptures else { return false }
+        isReprocessingCaptures = true
+        defer { isReprocessingCaptures = false }
+
+        do {
+            captures = try captureStore.rerenderAll(rotation: rotation)
+            latestImage = captures.first?.image
+            latestCaptureIndex = captures.first?.captureIndex
+            captureExportArchive = nil
+            return true
+        } catch {
+            captureError = "Could not rotate all captures: \(error.localizedDescription)"
+            return false
         }
     }
 

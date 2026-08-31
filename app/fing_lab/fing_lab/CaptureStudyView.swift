@@ -203,7 +203,10 @@ struct CaptureStudyView: View {
         case .transferFailed:
             return "The frame is retained on the ring. Reconnect if needed, then tap Resend."
         case .cameraError:
-            return "Capture failed before an image was available (firmware error \(status.detail))."
+            let stage = status.total >> 4
+            let burstFrame = status.total & 0x0F
+            let stageText = cameraStageDescription(stage, row: status.progress)
+            return "Capture failed on AE frame \(burstFrame)/4 while \(stageText) (firmware error \(status.detail))."
         case .cancelled:
             return "The capture stopped because the firmware left capture mode."
         case .resendAvailable:
@@ -212,6 +215,15 @@ struct CaptureStudyView: View {
             return "Restarting the retained image transfer from the beginning."
         case .awaitingAppAcknowledgement:
             return "The full frame was queued; waiting for the app to confirm it was saved."
+        case .cameraDiagnostic:
+            let encoded = status.total
+            let stage = encoded >> 4
+            let burstFrame = encoded & 0x0F
+            let stageText = cameraStageDescription(stage, row: status.progress)
+            let errorText = status.detail == 0
+                ? ""
+                : " Last camera result: \(status.detail)."
+            return "AE frame \(burstFrame)/4: \(stageText). Firmware time \(status.deviceTimestampMs) ms.\(errorText)"
         }
     }
 
@@ -220,8 +232,23 @@ struct CaptureStudyView: View {
         case .waiting: .secondary
         case .tofRejected, .cancelled, .resendAvailable: .orange
         case .tofError, .transferFailed, .cameraError: .red
+        case .cameraDiagnostic: .purple
         case .transferComplete: .green
         default: .blue
+        }
+    }
+
+    private func cameraStageDescription(_ stage: UInt8, row: UInt8) -> String {
+        switch stage {
+        case 0: "camera idle"
+        case 1: "starting a sensor frame"
+        case 2: "searching for vertical blank (probe \(row))"
+        case 3: "waiting for sensor row 0"
+        case 4: "receiving row \(row) of 244"
+        case 5: "draining a timed-out SPI transaction"
+        case 6: "frame acquisition complete"
+        case 7: "camera capture returned an error at row \(row)"
+        default: "unknown camera stage \(stage), row \(row)"
         }
     }
 

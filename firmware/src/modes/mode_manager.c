@@ -35,6 +35,71 @@ static uint16_t last_frame_distance_mm = CAPTURE_STATUS_DISTANCE_UNKNOWN;
 static bool last_frame_valid;
 static bool last_transfer_failed;
 static volatile uint32_t acknowledged_frame_id;
+static volatile bool camera_diagnostics_active;
+static volatile uint32_t diagnostic_attempt_id;
+static volatile uint16_t diagnostic_distance_mm;
+static volatile uint8_t diagnostic_burst_frame;
+
+#define CAMERA_DIAGNOSTIC_INTERVAL_MS 500U
+#define CAMERA_DIAGNOSTIC_WORK_QUEUE_PRIORITY 5
+#define CAMERA_DIAGNOSTIC_WORK_QUEUE_STACK_SIZE 1024
+
+static void camera_diagnostic_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(camera_diagnostic_work,
+                               camera_diagnostic_work_handler);
+static struct k_work_q camera_diagnostic_work_queue;
+K_THREAD_STACK_DEFINE(camera_diagnostic_work_queue_stack,
+                      CAMERA_DIAGNOSTIC_WORK_QUEUE_STACK_SIZE);
+
+static void camera_diagnostic_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    if (!camera_diagnostics_active) {
+        return;
+    }
+
+    struct camera_diagnostic_snapshot snapshot;
+    camera_get_diagnostic_snapshot(&snapshot);
+    /* detail carries the signed camera error. progress is the sensor row.
+     * The upper nibble of total carries the diagnostic stage; its lower
+     * nibble carries the current frame in the AE burst. */
+    uint8_t encoded_stage_frame =
+        ((uint8_t)snapshot.stage << 4) | (diagnostic_burst_frame & 0x0FU);
+    ble_publish_capture_status(CAPTURE_STATUS_CAMERA_DIAGNOSTIC,
+                               diagnostic_attempt_id,
+                               diagnostic_distance_mm,
+                               snapshot.last_error,
+                               snapshot.row,
+                               encoded_stage_frame);
+    (void)k_work_reschedule_for_queue(&camera_diagnostic_work_queue,
+                                     &camera_diagnostic_work,
+                                     K_MSEC(CAMERA_DIAGNOSTIC_INTERVAL_MS));
+}
+
+static void camera_diagnostics_start(uint32_t attempt_id,
+                                     uint16_t distance_mm,
+                                     uint8_t total_frames)
+{
+    diagnostic_attempt_id = attempt_id;
+    diagnostic_distance_mm = distance_mm;
+    diagnostic_burst_frame = 1U;
+    ARG_UNUSED(total_frames);
+    camera_diagnostics_active = true;
+    (void)k_work_reschedule_for_queue(&camera_diagnostic_work_queue,
+                                     &camera_diagnostic_work, K_MSEC(100));
+}
+
+static void camera_diagnostics_stop(void)
+{
+    camera_diagnostics_active = false;
+    (void)k_work_cancel_delayable(&camera_diagnostic_work);
+}
+
+static uint8_t encode_camera_diagnostic(const struct camera_diagnostic_snapshot *snapshot,
+                                        uint8_t burst_frame)
+{
+    return ((uint8_t)snapshot->stage << 4) | (burst_frame & 0x0FU);
+}
 
 static void publish_capture_readiness(void)
 {
@@ -97,6 +162,7 @@ static int capture_ae_stabilized_frame(uint32_t attempt_id,
             return -ECANCELED;
         }
 
+        diagnostic_burst_frame = (uint8_t)frame;
         int result = capture_full_frame();
         if (result != FRAME_BYTES) {
             return result;
@@ -227,7 +293,11 @@ static void handle_capture_trigger(void)
     ble_publish_capture_status(CAPTURE_STATUS_TOF_ACCEPTED,
                                attempt_id, distance_mm, 0, 0, 0);
 
+    camera_diagnostics_start(attempt_id, distance_mm,
+                             CAMERA_AE_DISCARD_FRAMES + 1U);
+
     int length = capture_ae_stabilized_frame(attempt_id, distance_mm);
+    camera_diagnostics_stop();
     if (length == -ECANCELED) {
         LOG_INF("Capture cancelled by mode request");
         ble_publish_capture_status(CAPTURE_STATUS_CANCELLED,
@@ -236,10 +306,14 @@ static void handle_capture_trigger(void)
         return;
     }
     if (length != FRAME_BYTES) {
+        struct camera_diagnostic_snapshot snapshot;
+        camera_get_diagnostic_snapshot(&snapshot);
         LOG_ERR("Camera capture failed: %d", length);
         ble_publish_capture_status(CAPTURE_STATUS_CAMERA_ERROR,
                                    attempt_id, distance_mm,
-                                   (int16_t)length, 0, 0);
+                                   (int16_t)length, snapshot.row,
+                                   encode_camera_diagnostic(&snapshot,
+                                                            diagnostic_burst_frame));
         return;
     }
     LOG_INF("Final image ready %u ms after MLC trigger",
@@ -347,6 +421,12 @@ static void handle_frame_ack(void)
 
 int mode_manager_init(void)
 {
+    k_work_queue_start(&camera_diagnostic_work_queue,
+                       camera_diagnostic_work_queue_stack,
+                       K_THREAD_STACK_SIZEOF(camera_diagnostic_work_queue_stack),
+                       CAMERA_DIAGNOSTIC_WORK_QUEUE_PRIORITY, NULL);
+    k_thread_name_set(&camera_diagnostic_work_queue.thread, "camera_diag");
+
     /* Match the known-good FingCam boot ordering: initialize the IMU side
      * before touching the camera.  ToF is also placed first so its 100 ms
      * power-up interval has elapsed before camera MCLK/register setup. */

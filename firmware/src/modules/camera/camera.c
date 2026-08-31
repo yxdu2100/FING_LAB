@@ -13,6 +13,7 @@
 #include "hm01b0_init.h"
 #include "camera.h"
 #include <zephyr/pm/device.h>
+#include <zephyr/sys/atomic.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(camera_module, LOG_LEVEL_INF);
@@ -34,7 +35,7 @@ static uint8_t frame_buf[FRAME_BYTES];
  * MAX_PROBE_LINES   : worst-case probes to walk through one active region
  */
 #define LINE_TIMEOUT_US   2500u
-#define VBLANK_WAIT_MS    350u
+#define VBLANK_WAIT_MS    700u
 #define MAX_PROBE_LINES   (IMG_H + 20)
 #define CAMERA_STREAM_REG_RETRIES 3
 #define CAMERA_STREAM_REG_RETRY_DELAY_MS 20
@@ -71,8 +72,38 @@ const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 static struct k_poll_signal line_done_sig;
 const struct device *spi_slave_dev;
 static struct k_poll_signal spi_slave_done_sig = K_POLL_SIGNAL_INITIALIZER(spi_slave_done_sig);
+/* Zephyr keeps the SPIS context lock until an asynchronous transaction
+ * completes. Calling spi_transceive_signal() again while a timed-out
+ * transaction is still armed therefore blocks forever inside the driver.
+ * This flag is owned by the capture thread and prevents that second arm. */
+static bool spis_transfer_pending;
+/* Packed atomically because the BLE diagnostic heartbeat reads this state
+ * from the system work queue while the mode-manager thread captures rows.
+ * Bits 0..7 hold the stage and bits 8..15 hold the current row. */
+static atomic_t camera_diag_state;
+static atomic_t camera_diag_error;
 
 static void mclk_stop(void);
+
+static void camera_diag_set(enum camera_diagnostic_stage stage,
+                            uint8_t row, int error)
+{
+    atomic_set(&camera_diag_error, error);
+    atomic_set(&camera_diag_state,
+               ((atomic_val_t)row << 8) | (atomic_val_t)stage);
+}
+
+void camera_get_diagnostic_snapshot(struct camera_diagnostic_snapshot *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    atomic_val_t packed = atomic_get(&camera_diag_state);
+    snapshot->stage = (enum camera_diagnostic_stage)(packed & 0xFF);
+    snapshot->row = (uint8_t)((packed >> 8) & 0xFF);
+    snapshot->last_error = (int16_t)atomic_get(&camera_diag_error);
+}
 
 static const struct spi_config spi_slave_cfg = {
 	.operation = SPI_WORD_SET(8) | SPI_TRANSFER_MSB | 
@@ -324,6 +355,7 @@ int camera_init(void)
         return -ENODEV;
     }
     k_poll_signal_init(&line_done_sig);
+    camera_diag_set(CAMERA_DIAG_IDLE, 0U, 0);
 
     /* The integrated firmware reaches main() much sooner than the original
      * camera-only firmware.  Give both the camera rails and the newly-started
@@ -382,6 +414,11 @@ static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
     struct spi_buf tx_buf = { .buf = dst, .len = IMG_W };
     struct spi_buf_set tx_set = { .buffers = &tx_buf, .count = 1 };
 
+    if (spis_transfer_pending) {
+        LOG_ERR("Refusing to arm SPIS while a previous transfer is pending");
+        return -EBUSY;
+    }
+
     /* Reset before arming. Resetting after the asynchronous call can erase a
      * completion that arrives between spi_transceive_signal() and reset(),
      * permanently shifting the line pipeline. */
@@ -393,12 +430,17 @@ static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
         LOG_ERR("spi_transceive_signal failed: %d", ret);
         return ret;
     }
+    spis_transfer_pending = true;
 
     struct k_poll_event evt;
     k_poll_event_init(&evt, K_POLL_TYPE_SIGNAL,
                       K_POLL_MODE_NOTIFY_ONLY, &line_done_sig);
 
-    return k_poll(&evt, 1, timeout);
+    ret = k_poll(&evt, 1, timeout);
+    if (ret == 0) {
+        spis_transfer_pending = false;
+    }
+    return ret;
 }
 
 /* Wait for an already-armed SPIS transfer to complete, without re-arming.
@@ -408,10 +450,19 @@ static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
  */
 static int spis_wait_only(k_timeout_t timeout)
 {
+    if (!spis_transfer_pending) {
+        LOG_ERR("SPIS wait requested without an armed transfer");
+        return -EINVAL;
+    }
+
     struct k_poll_event evt;
     k_poll_event_init(&evt, K_POLL_TYPE_SIGNAL,
                       K_POLL_MODE_NOTIFY_ONLY, &line_done_sig);
-    return k_poll(&evt, 1, timeout);
+    int ret = k_poll(&evt, 1, timeout);
+    if (ret == 0) {
+        spis_transfer_pending = false;
+    }
+    return ret;
 }
 
 /* Finish an asynchronous line transaction that timed out while armed.  The
@@ -420,13 +471,14 @@ static int spis_wait_only(k_timeout_t timeout)
  * context and the camera row pipeline permanently out of phase. */
 static int spis_drain_timed_out_transfer(void)
 {
+    camera_diag_set(CAMERA_DIAG_DRAINING_TRANSFER, 0U, -EAGAIN);
     int rc = spis_wait_only(K_MSEC(VBLANK_WAIT_MS));
     if (rc != 0) {
         LOG_ERR("Timed-out SPIS transfer did not drain: %d", rc);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, rc);
         return rc;
     }
 
-    k_poll_signal_reset(&line_done_sig);
     LOG_INF("Timed-out SPIS transfer drained; next attempt will re-sync");
     return 0;
 }
@@ -456,10 +508,26 @@ int camera_capture_frame(void)
 {
     int rc;
 
+    /* A previous attempt may have timed out while the asynchronous SPIS
+     * transaction was still waiting for LVLD/CS. Drain that transaction
+     * before entering spi_transceive_signal(); otherwise Zephyr waits forever
+     * on its internal context lock and the capture thread never returns. */
+    if (spis_transfer_pending) {
+        LOG_WRN("Draining SPIS transaction left by the previous attempt");
+        rc = spis_drain_timed_out_transfer();
+        if (rc != 0) {
+            return -ETIMEDOUT;
+        }
+    }
+
+    camera_diag_set(CAMERA_DIAG_FRAME_START, 0U, 0);
+
     /* ---------- Probe until V-blank ------------------------------- */
     bool in_vblank = false;
     int probes;
     for (probes = 0; probes < MAX_PROBE_LINES; probes++) {
+        camera_diag_set(CAMERA_DIAG_SEARCHING_VBLANK,
+                        (uint8_t)MIN(probes, UINT8_MAX), 0);
         rc = spis_arm_and_wait(probe_buf, K_USEC(LINE_TIMEOUT_US));
         if (rc == -EAGAIN) {
             /* No CS for > LINE_TIMEOUT_US -> we are in V-blank.
@@ -475,19 +543,23 @@ int camera_capture_frame(void)
 
     if (!in_vblank) {
         LOG_WRN("V-blank not found in %d probes; caller should retry", probes);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, -ETIMEDOUT);
         return -ETIMEDOUT;
     }
 
     /* ---------- Harvest row 0 of the new frame -------------------- */
+    camera_diag_set(CAMERA_DIAG_WAITING_ROW_ZERO, 0U, 0);
     rc = spis_wait_only(K_MSEC(VBLANK_WAIT_MS));
     if (rc != 0) {
         LOG_WRN("Row 0 wait timed out (rc=%d); caller should retry", rc);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, rc);
         return -ETIMEDOUT;
     }
     memcpy(&frame_buf[0], probe_buf, IMG_W);
 
     /* ---------- Capture rows 1..IMG_H-1 --------------------------- */
     for (int line = 1; line < IMG_H; line++) {
+        camera_diag_set(CAMERA_DIAG_CAPTURING_ROWS, (uint8_t)line, 0);
         uint8_t *line_ptr = &frame_buf[line * IMG_W];
         rc = spis_arm_and_wait(line_ptr, K_USEC(LINE_TIMEOUT_US));
         if (rc != 0) {
@@ -497,12 +569,19 @@ int camera_capture_frame(void)
                  * transaction armed. Drain it before returning so the retry
                  * is independent instead of inheriting a stale row. */
                 int drain_rc = spis_drain_timed_out_transfer();
-                return drain_rc == 0 ? -EAGAIN : -ETIMEDOUT;
+                if (drain_rc == 0) {
+                    camera_diag_set(CAMERA_DIAG_ERROR, (uint8_t)line,
+                                    -EAGAIN);
+                    return -EAGAIN;
+                }
+                return -ETIMEDOUT;
             }
+            camera_diag_set(CAMERA_DIAG_ERROR, (uint8_t)line, -EIO);
             return -EIO;
         }
     }
 
+    camera_diag_set(CAMERA_DIAG_FRAME_COMPLETE, IMG_H, 0);
     return FRAME_BYTES;
 }
 
@@ -516,13 +595,23 @@ static void mclk_stop(void)
 
 int camera_standby(void)
 {
+    /* Give a pending line its final opportunity to complete while the camera
+     * is still producing LVLD/CS. Never clear its completion signal while the
+     * Zephyr SPIS driver still owns the transaction. */
+    if (spis_transfer_pending) {
+        LOG_WRN("Draining pending SPIS transfer before camera standby");
+        (void)spis_drain_timed_out_transfer();
+    }
+
     int first_err = camera_write_reg(i2c_dev, 0x0100, 0x00);
     if (first_err) {
         LOG_ERR("Camera standby stream-off failed: %d", first_err);
     }
     k_msleep(10);
     mclk_stop();
-    k_poll_signal_reset(&line_done_sig);
+    if (!spis_transfer_pending) {
+        k_poll_signal_reset(&line_done_sig);
+    }
     int err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_SUSPEND);
     if (err) {
         LOG_ERR("Failed to suspend SPI Slave: %d", err);
@@ -531,6 +620,7 @@ int camera_standby(void)
         }
     }
     LOG_INF("Camera Standby & SPI Slave Suspended");
+    camera_diag_set(CAMERA_DIAG_IDLE, 0U, first_err);
     return first_err;
 }
 

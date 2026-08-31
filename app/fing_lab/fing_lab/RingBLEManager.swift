@@ -600,7 +600,17 @@ extension RingBLEManager: CBPeripheralDelegate {
             guard let status = CaptureStatus(data: data) else { return }
             latestCaptureStatus = status
             onCaptureStatusReceived?(status)
-            if captureStatusHistory.first != status {
+            if status.event == .cameraDiagnostic,
+               let previous = captureStatusHistory.first,
+               previous.event == .cameraDiagnostic,
+               previous.attemptID == status.attemptID,
+               previous.detail == status.detail,
+               previous.progress == status.progress,
+               previous.total == status.total {
+                // A diagnostic heartbeat repeats while a camera call is
+                // blocked. Replace its timestamp instead of flooding history.
+                captureStatusHistory[0] = status
+            } else if captureStatusHistory.first != status {
                 captureStatusHistory.insert(status, at: 0)
                 if captureStatusHistory.count > 12 {
                     captureStatusHistory.removeLast(captureStatusHistory.count - 12)

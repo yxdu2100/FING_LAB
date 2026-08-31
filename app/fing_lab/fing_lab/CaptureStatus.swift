@@ -17,6 +17,7 @@ enum CaptureStatusEvent: UInt8, Sendable {
     case resendAvailable = 13
     case resendStarted = 14
     case awaitingAppAcknowledgement = 15
+    case cameraDiagnostic = 16
 
     var title: String {
         switch self {
@@ -36,6 +37,7 @@ enum CaptureStatusEvent: UInt8, Sendable {
         case .resendAvailable: "Image ready to resend"
         case .resendStarted: "Resending image"
         case .awaitingAppAcknowledgement: "Confirming image save"
+        case .cameraDiagnostic: "Camera diagnostic"
         }
     }
 
@@ -55,6 +57,7 @@ enum CaptureStatusEvent: UInt8, Sendable {
         case .transferFailed: "wifi.exclamationmark"
         case .cancelled: "xmark.circle"
         case .resendAvailable: "arrow.clockwise.circle"
+        case .cameraDiagnostic: "waveform.path.ecg"
         }
     }
 

@@ -53,6 +53,10 @@ struct SettingsView: View {
                 }
 
                 Section("Captured Images") {
+                    Toggle(
+                        "Sound when image transfer starts",
+                        isOn: $settings.captureTransferStartAudio
+                    )
                     Picker("Image rotation", selection: rotationBinding) {
                         ForEach(CaptureImageRotation.allCases) { rotation in
                             Text(rotation.label).tag(rotation)
@@ -62,6 +66,9 @@ struct SettingsView: View {
                         ProgressView("Updating saved PNG files…")
                     }
                     Text("The selected rotation is applied to the current preview, every saved PNG, and all future captures. Raw Bayer files are never modified.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("The sound plays after the fourth camera frame is ready, when BLE image transfer begins.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

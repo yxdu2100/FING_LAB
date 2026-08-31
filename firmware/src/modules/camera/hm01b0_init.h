@@ -81,15 +81,14 @@ struct sensor_reg hm01b0_324x244[] = {
     // {0x0341,0x90},//800
     // {0x0340,0x02},
     // {0x0341,0xE8},//1000
-    {0x0342,0x02},
-    {0x0343,0x71},//625 line_length_pck
+    {0x0342,(CAMERA_LINE_LENGTH_PCK >> 8) & 0xFFU},
+    {0x0343,CAMERA_LINE_LENGTH_PCK & 0xFFU},
 
-    /* Keep the 625-pixel line period so the MCU retains ~301 us of
-     * horizontal blanking to re-arm SPIS.  Shorten only vertical blanking:
-     * 1 MHz / (625 * 400) = 4 FPS.  MAX_INTG=376 remains valid because it is
-     * no greater than frame_length_lines - 2. */
-    {0x0340,0x01},
-    {0x0341,0x90},//400 frame_length_lines => 4 FPS @ 1 MHz vt_pix_clk
+    /* 800 clocks per row leaves about 476 us after each 324 us pixel burst
+     * for Zephyr and the SPIS driver to arm the following row.  313 rows
+     * retain approximately 4 FPS: 1 MHz / (800 * 313) = 3.99 FPS. */
+    {0x0340,(CAMERA_FRAME_LENGTH_LINES >> 8) & 0xFFU},
+    {0x0341,CAMERA_FRAME_LENGTH_LINES & 0xFFU},
     // {0x0342,0x09},
     // {0x0343,0xC4},//2500
 

@@ -17,6 +17,7 @@ final class RingBLEManager: NSObject {
     var onSamplesReceived: (([IMUSample]) -> Void)?
     var onConnectionEvent: ((String, UInt64?) -> Void)?
     var onFrameReceived: ((ReassembledFrame) -> Void)?
+    var onCaptureStatusReceived: ((CaptureStatus) -> Void)?
     /// The coordinator uses this to prohibit changing hardware in the middle
     /// of a Phase 3/4 recording, including while that recording is paused.
     var deviceSwitchAllowed: (() -> Bool)?
@@ -598,6 +599,7 @@ extension RingBLEManager: CBPeripheralDelegate {
         if characteristic.uuid == BLEConstants.captureStatusUUID {
             guard let status = CaptureStatus(data: data) else { return }
             latestCaptureStatus = status
+            onCaptureStatusReceived?(status)
             if captureStatusHistory.first != status {
                 captureStatusHistory.insert(status, at: 0)
                 if captureStatusHistory.count > 12 {

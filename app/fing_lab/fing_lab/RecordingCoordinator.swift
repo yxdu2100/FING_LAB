@@ -36,6 +36,14 @@ final class AppSettings {
             )
         }
     }
+    var captureTransferStartAudio: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                captureTransferStartAudio,
+                forKey: CaptureFeedbackPreferences.transferStartAudioDefaultsKey
+            )
+        }
+    }
 
     var enabledGestures: [GestureDefinition] {
         let defaults = GestureDefinition.defaults
@@ -82,6 +90,7 @@ final class AppSettings {
         // Migrate installations of RingCollector that stored the old label.
         enabledGestureIDs = savedGestureIDs.map { $0 == "pinch_hold" ? "hover" : $0 }
         captureImageRotation = CaptureRenderSettings.currentRotation
+        captureTransferStartAudio = CaptureFeedbackPreferences.isTransferStartAudioEnabled
     }
 }
 
@@ -104,6 +113,7 @@ final class RecordingCoordinator {
     var captureError: String?
     var captureExportArchive: URL?
     var isReprocessingCaptures = false
+    private var lastTransferSoundStatusID: String?
 
     init() {
         ble.deviceSwitchAllowed = { [weak self] in
@@ -122,6 +132,15 @@ final class RecordingCoordinator {
             if event == "disconnect" {
                 self.quality.recordDisconnect()
             }
+        }
+
+        ble.onCaptureStatusReceived = { [weak self] status in
+            guard let self,
+                  status.event == .transferStarted,
+                  CaptureFeedbackPreferences.isTransferStartAudioEnabled,
+                  self.lastTransferSoundStatusID != status.id else { return }
+            self.lastTransferSoundStatusID = status.id
+            FeedbackManager.imageTransferStarted()
         }
 
         do {

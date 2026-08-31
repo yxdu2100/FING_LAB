@@ -23,6 +23,11 @@ enum FeedbackManager {
         AudioServicesPlaySystemSound(1057)
     }
 
+    static func imageTransferStarted() {
+        notification.notificationOccurred(.success)
+        AudioServicesPlaySystemSound(1057)
+    }
+
     static func blockStart() {
         medium.impactOccurred()
     }
@@ -33,6 +38,15 @@ enum FeedbackManager {
 
     static func warning() {
         notification.notificationOccurred(.warning)
+    }
+}
+
+enum CaptureFeedbackPreferences {
+    static let transferStartAudioDefaultsKey = "FingLab.captureTransferStartAudio"
+
+    static var isTransferStartAudioEnabled: Bool {
+        let defaults = UserDefaults.standard
+        return defaults.object(forKey: transferStartAudioDefaultsKey) as? Bool ?? true
     }
 }
 

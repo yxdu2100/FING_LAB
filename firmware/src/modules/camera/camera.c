@@ -23,10 +23,10 @@ static uint8_t frame_buf[FRAME_BYTES];
 
 /* Frame-sync tuning.
  *
- * With the HM01B0 running at 1 MHz vt_pix_clk, line_length_pck = 625:
- *   line period  ~= 625 us       (active 324 us + H-blank ~301 us)
- *   V-blank      ~= 97.5 ms      (156 blank lines * 625 us)
- *   frame period ~= 250 ms       (4 FPS)
+ * With the HM01B0 running at 1 MHz vt_pix_clk, line_length_pck = 800:
+ *   line period  ~= 800 us       (active 324 us + H-blank ~476 us)
+ *   V-blank      ~= 55.2 ms      (69 blank lines * 800 us)
+ *   frame period ~= 250.4 ms     (~4 FPS)
  *
  * LINE_TIMEOUT_US   : must be  >  1 line-period + scheduler jitter
  *                              <  V-blank duration
@@ -382,16 +382,17 @@ static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
     struct spi_buf tx_buf = { .buf = dst, .len = IMG_W };
     struct spi_buf_set tx_set = { .buffers = &tx_buf, .count = 1 };
 
+    /* Reset before arming. Resetting after the asynchronous call can erase a
+     * completion that arrives between spi_transceive_signal() and reset(),
+     * permanently shifting the line pipeline. */
+    k_poll_signal_reset(&line_done_sig);
+
     int ret = spi_transceive_signal(spi_slave_dev, &spi_slave_cfg,
                                     &tx_set, &rx_set, &line_done_sig);
     if (ret != 0) {
         LOG_ERR("spi_transceive_signal failed: %d", ret);
         return ret;
     }
-
-    /* Clear any stale signal raised by the previous transfer's ISR,
-     * now that the new transfer is armed but has not yet completed. */
-    k_poll_signal_reset(&line_done_sig);
 
     struct k_poll_event evt;
     k_poll_event_init(&evt, K_POLL_TYPE_SIGNAL,
@@ -411,6 +412,23 @@ static int spis_wait_only(k_timeout_t timeout)
     k_poll_event_init(&evt, K_POLL_TYPE_SIGNAL,
                       K_POLL_MODE_NOTIFY_ONLY, &line_done_sig);
     return k_poll(&evt, 1, timeout);
+}
+
+/* Finish an asynchronous line transaction that timed out while armed.  The
+ * next LVLD/CS edge completes it, normally at row 0 after vertical blanking.
+ * Starting another transfer before this drain completes leaves Zephyr's SPIS
+ * context and the camera row pipeline permanently out of phase. */
+static int spis_drain_timed_out_transfer(void)
+{
+    int rc = spis_wait_only(K_MSEC(VBLANK_WAIT_MS));
+    if (rc != 0) {
+        LOG_ERR("Timed-out SPIS transfer did not drain: %d", rc);
+        return rc;
+    }
+
+    k_poll_signal_reset(&line_done_sig);
+    LOG_INF("Timed-out SPIS transfer drained; next attempt will re-sync");
+    return 0;
 }
 
 /* Capture a single IMG_WxIMG_H frame into frame_buf, frame-aligned.
@@ -473,10 +491,15 @@ int camera_capture_frame(void)
         uint8_t *line_ptr = &frame_buf[line * IMG_W];
         rc = spis_arm_and_wait(line_ptr, K_USEC(LINE_TIMEOUT_US));
         if (rc != 0) {
-            /* Mid-frame stall (likely a missed line). Drop this frame;
-             * next call will resync via the probe phase. */
             LOG_WRN("Line %d stalled (rc=%d), dropping frame", line, rc);
-            return -EAGAIN;
+            if (rc == -EAGAIN) {
+                /* spis_arm_and_wait() deliberately leaves a timed-out
+                 * transaction armed. Drain it before returning so the retry
+                 * is independent instead of inheriting a stale row. */
+                int drain_rc = spis_drain_timed_out_transfer();
+                return drain_rc == 0 ? -EAGAIN : -ETIMEDOUT;
+            }
+            return -EIO;
         }
     }
 

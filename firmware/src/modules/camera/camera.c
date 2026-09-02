@@ -5,6 +5,7 @@
 #include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <hal/nrf_gpio.h>
 #include <hal/nrf_gpiote.h>
 #include <hal/nrf_timer.h>
@@ -54,7 +55,7 @@ static uint8_t frame_buf[FRAME_BYTES];
  * known-working address and is copied into its final frame row only after
  * completion.  The same buffer is also used to swallow probe lines while
  * finding vertical blanking. */
-static uint8_t probe_buf[IMG_W] __aligned(32);
+static uint8_t probe_buf[IMG_W];
 
 #define MY_SPI_SLAVE  DT_NODELABEL(my_spi_slave)
 #define I2C_NODE DT_NODELABEL(i2c21)
@@ -95,9 +96,13 @@ static atomic_t camera_diag_state;
 static atomic_t camera_diag_error;
 static uint8_t mclk_gppi_channel;
 static bool mclk_gppi_channel_allocated;
+static struct onoff_manager *camera_hfclk_manager;
+static struct onoff_client camera_hfclk_client;
+static bool camera_hfclk_requested;
 
 static void mclk_stop(void);
 static int camera_recover_pending_transfer(void);
+static int camera_ensure_streaming(void);
 
 static void camera_diag_set(enum camera_diagnostic_stage stage,
                             uint8_t row, int error)
@@ -262,8 +267,68 @@ static int configure_mclk_gppi(void)
     return 0;
 }
 
+static int camera_hfclk_acquire(void)
+{
+    if (camera_hfclk_requested) {
+        return 0;
+    }
+
+    camera_hfclk_manager =
+        z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF);
+    if (camera_hfclk_manager == NULL) {
+        LOG_ERR("Cannot get HF clock manager for camera MCLK");
+        return -ENXIO;
+    }
+
+    sys_notify_init_spinwait(&camera_hfclk_client.notify);
+    int err = onoff_request(camera_hfclk_manager, &camera_hfclk_client);
+    if (err < 0) {
+        LOG_ERR("Camera HF clock request failed: %d", err);
+        return err;
+    }
+
+    int result = 0;
+    do {
+        err = sys_notify_fetch_result(&camera_hfclk_client.notify, &result);
+        if (err == -EAGAIN) {
+            k_yield();
+        }
+    } while (err == -EAGAIN);
+
+    if (err != 0 || result != 0) {
+        LOG_ERR("Camera HF clock did not start: notify=%d result=%d",
+                err, result);
+        (void)onoff_cancel_or_release(camera_hfclk_manager,
+                                      &camera_hfclk_client);
+        return err != 0 ? err : result;
+    }
+
+    camera_hfclk_requested = true;
+    LOG_INF("HF clock held for camera MCLK");
+    return 0;
+}
+
+static void camera_hfclk_release(void)
+{
+    if (!camera_hfclk_requested) {
+        return;
+    }
+
+    int err = onoff_cancel_or_release(camera_hfclk_manager,
+                                      &camera_hfclk_client);
+    if (err < 0) {
+        LOG_WRN("Camera HF clock release failed: %d", err);
+    }
+    camera_hfclk_requested = false;
+}
+
 static int mclk_start(void)
 {
+    int err = camera_hfclk_acquire();
+    if (err != 0) {
+        return err;
+    }
+
     /* Reapply the complete path on every restart. These registers are
      * controlled directly, so Zephyr cannot restore them for us if another
      * peripheral or a power transition changes their state. */
@@ -280,8 +345,9 @@ static int mclk_start(void)
     NRF_TIMER_REG->CC[0] = 1;  // 1 tick @ 16MHz = 16M events/sec -> 8MHz toggle
     NRF_TIMER_REG->SHORTS = (TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos);
 
-    int err = configure_mclk_gppi();
+    err = configure_mclk_gppi();
     if (err != 0) {
+        camera_hfclk_release();
         return err;
     }
 
@@ -559,6 +625,16 @@ int camera_capture_frame(void)
         }
     }
 
+    /* The RTT trace showed MODE_SELECT returning to standby while capture
+     * mode was still active. Verify/restart the sensor before arming an async
+     * SPIS request, because a request armed against a stopped sensor cannot
+     * be cancelled safely through Zephyr's public SPI API. */
+    rc = camera_ensure_streaming();
+    if (rc != 0) {
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, rc);
+        return -ETIMEDOUT;
+    }
+
     camera_diag_set(CAMERA_DIAG_FRAME_START, 0U, 0);
 
     /* ---------- Probe until V-blank ------------------------------- */
@@ -634,6 +710,7 @@ static void mclk_stop(void)
 {
     NRF_TIMER_REG->TASKS_STOP = 1;
     NRF_TIMER_REG->TASKS_CLEAR = 1;
+    camera_hfclk_release();
     LOG_INF("MCLK Stopped");
 }
 
@@ -709,6 +786,39 @@ static int camera_start_streaming_with_retry(void)
     }
 
     return err;
+}
+
+static int camera_ensure_streaming(void)
+{
+    uint8_t mode = 0xFFU;
+    int err = camera_read_reg(0x0100, &mode);
+
+    if (err == 0 && mode == 0x01U) {
+        return 0;
+    }
+
+    LOG_WRN("Camera was not streaming before capture: mode=0x%02x err=%d",
+            mode, err);
+    err = mclk_start();
+    if (err == 0) {
+        k_msleep(CAMERA_MCLK_SETTLE_MS);
+        err = camera_start_streaming_with_retry();
+    }
+    if (err != 0) {
+        return err;
+    }
+
+    k_msleep(CAMERA_RECOVERY_SETTLE_MS);
+    err = camera_read_reg(0x0100, &mode);
+    if (err != 0) {
+        return err;
+    }
+    if (mode != 0x01U) {
+        LOG_ERR("Camera rejected stream-on before capture: mode=0x%02x",
+                mode);
+        return -EIO;
+    }
+    return 0;
 }
 
 /* Zephyr's asynchronous SPIS API does not expose a safe cancellation call.
@@ -867,6 +977,11 @@ int camera_wake_up(void)
     }
 
     k_msleep(100);
+    err = camera_ensure_streaming();
+    if (err != 0) {
+        LOG_ERR("Camera did not remain streaming after wake: %d", err);
+        return err;
+    }
     LOG_INF("Camera wake complete");
     return 0;
 }

@@ -57,11 +57,36 @@
 
 /* Capture gesture configuration.
  *
- * Replace modules/imu/mlc.h when exporting a new MEMS Studio classifier,
- * then set this value to the MLC1_SRC class that should start capture.  No
- * camera, ToF, BLE, or app code needs to know the gesture's name.
+ * Both implementations remain compiled into the firmware. Change only
+ * CAPTURE_GESTURE_SOURCE to switch between the original MEMS Studio MLC
+ * interrupt and the host-side rolling-window hover detector.
  */
+#define CAPTURE_GESTURE_SOURCE_MLC        0U
+#define CAPTURE_GESTURE_SOURCE_THRESHOLD  1U
+#define CAPTURE_GESTURE_SOURCE CAPTURE_GESTURE_SOURCE_THRESHOLD
+
+/* Original MLC path. Replace modules/imu/mlc.h when exporting a classifier,
+ * then select the MLC source above and set its target class here. */
 #define CAPTURE_MLC_TARGET_CLASS 0x00U
+
+/* Threshold hover path. The supplied decision tree classifies a window as
+ * hover when max(accel Y) <= 0.188720 g and min(accel Y) > -0.444580 g.
+ * Capture mode uses +/-8 g (4096 LSB/g), producing the rounded raw limits
+ * below. Fifty samples at 120 Hz reproduce a roughly 417 ms feature window.
+ * A complete non-hover window is required before the first trigger, and
+ * after every trigger, so a stationary ring cannot repeatedly take photos. */
+#define CAPTURE_HOVER_SAMPLE_RATE_HZ       120U
+#define CAPTURE_HOVER_SAMPLE_PERIOD_US     \
+    (1000000U / CAPTURE_HOVER_SAMPLE_RATE_HZ)
+#define CAPTURE_HOVER_WINDOW_SAMPLES       50U
+#define CAPTURE_HOVER_MAX_Y_RAW            773
+#define CAPTURE_HOVER_MIN_Y_RAW            (-1821)
+#define CAPTURE_HOVER_REARM_COOLDOWN_MS    750U
+
+#if CAPTURE_GESTURE_SOURCE != CAPTURE_GESTURE_SOURCE_MLC && \
+    CAPTURE_GESTURE_SOURCE != CAPTURE_GESTURE_SOURCE_THRESHOLD
+#error "CAPTURE_GESTURE_SOURCE must select MLC or threshold"
+#endif
 
 #define EVENT_IMU_CAPTURE_GESTURE (1U << 0)
 

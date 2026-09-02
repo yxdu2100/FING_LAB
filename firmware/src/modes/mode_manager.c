@@ -124,6 +124,14 @@ static void on_capture_gesture(void)
     k_event_post(&mode_events, EVENT_CAPTURE_TRIGGER);
 }
 
+static void rearm_capture_detector_if_active(void)
+{
+    if (active_mode == FING_MODE_CAPTURE &&
+        requested_mode == FING_MODE_CAPTURE) {
+        imu_rearm_capture_detector();
+    }
+}
+
 static bool distance_is_in_range(uint16_t distance_mm)
 {
     return distance_mm >= TOF_MIN_DISTANCE_MM &&
@@ -139,7 +147,10 @@ static int capture_full_frame(void)
         if (result == FRAME_BYTES) {
             break;
         }
-        if (result != -EAGAIN && result != -ETIMEDOUT) {
+        /* -ETIMEDOUT means the sensor produced no line and left an async SPIS
+         * transaction armed. Repeating immediately only spends several more
+         * seconds in the same unrecoverable driver context. */
+        if (result != -EAGAIN) {
             break;
         }
         LOG_WRN("Capture sync miss %d/%d (err=%d)",
@@ -188,7 +199,7 @@ static void enter_idle(void)
     /* The active profile is stopped before the BLE-visible mode changes.
      * That makes a mode acknowledgement mean its data path is fully quiet. */
     if (active_mode == FING_MODE_CAPTURE) {
-        imu_stop_mlc();
+        imu_stop_capture_detector();
         (void)camera_standby();
     } else if (active_mode == FING_MODE_STREAM) {
         imu_stream_stop();
@@ -214,7 +225,7 @@ static int enter_mode(enum fing_mode target)
          * photos to lose the camera's I2C acknowledgement. */
         err = camera_wake_up();
         if (err == 0) {
-            err = imu_start_mlc();
+            err = imu_start_capture_detector();
         }
         if (err != 0) {
             (void)camera_standby();
@@ -261,7 +272,7 @@ static void transition_to(enum fing_mode target)
 static void handle_capture_trigger(void)
 {
     if (active_mode != FING_MODE_CAPTURE) {
-        LOG_INF("Ignoring stale MLC trigger outside capture mode");
+        LOG_INF("Ignoring stale gesture trigger outside capture mode");
         return;
     }
 
@@ -283,6 +294,7 @@ static void handle_capture_trigger(void)
                                    attempt_id,
                                    CAPTURE_STATUS_DISTANCE_UNKNOWN,
                                    (int16_t)err, 0, 0);
+        rearm_capture_detector_if_active();
         return;
     }
     if (!distance_is_in_range(distance_mm)) {
@@ -290,6 +302,7 @@ static void handle_capture_trigger(void)
                 distance_mm, TOF_MIN_DISTANCE_MM, TOF_MAX_DISTANCE_MM);
         ble_publish_capture_status(CAPTURE_STATUS_TOF_REJECTED,
                                    attempt_id, distance_mm, 0, 0, 0);
+        rearm_capture_detector_if_active();
         return;
     }
     ble_publish_capture_status(CAPTURE_STATUS_TOF_ACCEPTED,
@@ -305,6 +318,7 @@ static void handle_capture_trigger(void)
         ble_publish_capture_status(CAPTURE_STATUS_CANCELLED,
                                    attempt_id, distance_mm,
                                    (int16_t)length, 0, 0);
+        rearm_capture_detector_if_active();
         return;
     }
     if (length != FRAME_BYTES) {
@@ -320,9 +334,10 @@ static void handle_capture_trigger(void)
                                    (int16_t)length, snapshot.row,
                                    encode_camera_diagnostic(&snapshot,
                                                             diagnostic_burst_frame));
+        rearm_capture_detector_if_active();
         return;
     }
-    LOG_INF("Final image ready %u ms after MLC trigger",
+    LOG_INF("Final image ready %u ms after gesture trigger",
             k_uptime_get_32() - trigger_ms);
     last_frame_id = next_frame_id++;
     last_frame_timestamp_ms = k_uptime_get_32();
@@ -343,6 +358,7 @@ static void handle_capture_trigger(void)
         ble_publish_capture_status(CAPTURE_STATUS_TRANSFER_FAILED,
                                    attempt_id, distance_mm,
                                    -ENOTCONN, 0, 0);
+        rearm_capture_detector_if_active();
         return;
     }
 
@@ -365,9 +381,10 @@ static void handle_capture_trigger(void)
     } else {
         ble_publish_capture_status(CAPTURE_STATUS_AWAITING_APP_ACK,
                                    attempt_id, distance_mm, 0, 0, 0);
-        LOG_INF("Image queued to BLE %u ms after MLC trigger; awaiting app ACK",
+        LOG_INF("Image queued to BLE %u ms after gesture trigger; awaiting app ACK",
                 k_uptime_get_32() - trigger_ms);
     }
+    rearm_capture_detector_if_active();
 }
 
 static void handle_resend_request(void)

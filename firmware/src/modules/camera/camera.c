@@ -34,7 +34,7 @@ static uint8_t frame_buf[FRAME_BYTES];
  * VBLANK_WAIT_MS    : must be  >  V-blank duration
  * MAX_PROBE_LINES   : worst-case probes to walk through one active region
  */
-#define LINE_TIMEOUT_US   2500u
+#define LINE_TIMEOUT_US   8000u
 #define VBLANK_WAIT_MS    700u
 #define MAX_PROBE_LINES   (IMG_H + 20)
 #define CAMERA_STREAM_REG_RETRIES 3
@@ -43,10 +43,18 @@ static uint8_t frame_buf[FRAME_BYTES];
 #define CAMERA_BOOT_SETTLE_MS 100
 #define CAMERA_INIT_RETRIES 10
 #define CAMERA_INIT_RETRY_DELAY_MS 100
+#define CAMERA_RECOVERY_SETTLE_MS 100
 
-/* Throwaway buffer used to swallow lines until we detect V-blank, and
- * to capture row 0 of the next frame (see camera_capture_frame). */
-static uint8_t probe_buf[IMG_W];
+/* Fixed SPIS EasyDMA staging buffer.
+ *
+ * Do not point the peripheral directly at successive rows of frame_buf.
+ * Doing so makes the DMA destination change on every line.  Keeping the
+ * address fixed removes that variable from the repeatable timeout observed
+ * around row 161/162.  Every hardware transfer now lands at this single
+ * known-working address and is copied into its final frame row only after
+ * completion.  The same buffer is also used to swallow probe lines while
+ * finding vertical blanking. */
+static uint8_t probe_buf[IMG_W] __aligned(32);
 
 #define MY_SPI_SLAVE  DT_NODELABEL(my_spi_slave)
 #define I2C_NODE DT_NODELABEL(i2c21)
@@ -77,13 +85,19 @@ static struct k_poll_signal spi_slave_done_sig = K_POLL_SIGNAL_INITIALIZER(spi_s
  * transaction is still armed therefore blocks forever inside the driver.
  * This flag is owned by the capture thread and prevents that second arm. */
 static bool spis_transfer_pending;
+/* Final destination for the transfer currently armed on probe_buf.  It stays
+ * valid across a timeout because frame_buf and probe_buf are static. */
+static uint8_t *spis_pending_destination;
 /* Packed atomically because the BLE diagnostic heartbeat reads this state
  * from the system work queue while the mode-manager thread captures rows.
  * Bits 0..7 hold the stage and bits 8..15 hold the current row. */
 static atomic_t camera_diag_state;
 static atomic_t camera_diag_error;
+static uint8_t mclk_gppi_channel;
+static bool mclk_gppi_channel_allocated;
 
 static void mclk_stop(void);
+static int camera_recover_pending_transfer(void);
 
 static void camera_diag_set(enum camera_diagnostic_stage stage,
                             uint8_t row, int error)
@@ -219,16 +233,15 @@ static int camera_load_regs(const struct device *i2c_dev,
 }
 
 ///* ---------- MCLK INIT ---------- */
-static void configure_mclk_gppi(void)
+static int configure_mclk_gppi(void)
 {
-    nrfx_err_t err;
-    uint8_t gppi_channel;
-
-    /*  Allocate a GPPI channel */
-    err = nrfx_gppi_channel_alloc(&gppi_channel);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("nrfx_gppi_channel_alloc failed: %08x", err);
-        return;
+    if (!mclk_gppi_channel_allocated) {
+        nrfx_err_t err = nrfx_gppi_channel_alloc(&mclk_gppi_channel);
+        if (err != NRFX_SUCCESS) {
+            LOG_ERR("MCLK GPPI channel allocation failed: %08x", err);
+            return -ENOMEM;
+        }
+        mclk_gppi_channel_allocated = true;
     }
     
     uint32_t timer_compare_evt = nrf_timer_event_address_get(NRF_TIMER_REG,
@@ -239,20 +252,21 @@ static void configure_mclk_gppi(void)
                                                             nrf_gpiote_out_task_get(MCLK_GPIOTE_CH));
 
     /*  - Connect the event to the task */
-    nrfx_gppi_channel_endpoints_setup(gppi_channel,
+    nrfx_gppi_channel_endpoints_setup(mclk_gppi_channel,
                                       timer_compare_evt, 
                                       gpiote_task_addr);
 
     /*  Enable the channel*/
-    nrfx_gppi_channels_enable(BIT(gppi_channel));
-    LOG_INF("GPPI (DPPI) channel %d configured", gppi_channel);
+    nrfx_gppi_channels_enable(BIT(mclk_gppi_channel));
+    LOG_INF("GPPI (DPPI) channel %d configured", mclk_gppi_channel);
+    return 0;
 }
 
-void mclk_init(void)
+static int mclk_start(void)
 {
-    LOG_INF("Starting 8MHz wave generator on P1.08 using register access + DPPI");
-
-    /* * Configure pin as output*/
+    /* Reapply the complete path on every restart. These registers are
+     * controlled directly, so Zephyr cannot restore them for us if another
+     * peripheral or a power transition changes their state. */
     nrf_gpio_cfg_output(MCLK_PIN);
 
     NRF_GPIOTE_REG->CONFIG[MCLK_GPIOTE_CH] =
@@ -260,20 +274,29 @@ void mclk_init(void)
                         (GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos) |
                         (MCLK_PIN << GPIOTE_CONFIG_PSEL_Pos) |
                         (GPIOTE_CONFIG_OUTINIT_Low << GPIOTE_CONFIG_OUTINIT_Pos);
-    LOG_INF("GPIOTE channel %d configured", MCLK_GPIOTE_CH);
-
+    NRF_TIMER_REG->TASKS_STOP = 1;
+    NRF_TIMER_REG->TASKS_CLEAR = 1;
     NRF_TIMER_REG->PRESCALER = 0;
     NRF_TIMER_REG->CC[0] = 1;  // 1 tick @ 16MHz = 16M events/sec -> 8MHz toggle
     NRF_TIMER_REG->SHORTS = (TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos);
-    LOG_INF("Timer configured");
 
-    /* Configure the peripherals */
-    configure_mclk_gppi(); // Connects TIMER and GPIOTE
+    int err = configure_mclk_gppi();
+    if (err != 0) {
+        return err;
+    }
 
-    /* * Start the timer*/
     NRF_TIMER_REG->TASKS_START = 1;
-    LOG_INF("Timer started. 8MHz wave should be generating.");
+    return 0;
+}
 
+static int mclk_init(void)
+{
+    LOG_INF("Starting 8MHz wave generator on P1.08 using register access + DPPI");
+    int err = mclk_start();
+    if (err == 0) {
+        LOG_INF("Timer started. 8MHz wave should be generating.");
+    }
+    return err;
 }
 
 /* ==========================================
@@ -338,7 +361,10 @@ int camera_init(void)
     int ret;
 
     // Initialize MCLK
-    mclk_init();
+    ret = mclk_init();
+    if (ret != 0) {
+        return ret;
+    }
     // Initialize I2C
     if (!device_is_ready(i2c_dev)) {
         LOG_ERR("I2C device not ready");
@@ -407,11 +433,23 @@ int camera_init(void)
  * can follow up with spis_wait_only() to harvest that pending transfer
  * as the first line of the next frame.
  */
+static void spis_complete_pending_transfer(void)
+{
+    if (spis_pending_destination != NULL &&
+        spis_pending_destination != probe_buf) {
+        memcpy(spis_pending_destination, probe_buf, IMG_W);
+    }
+    spis_pending_destination = NULL;
+    spis_transfer_pending = false;
+}
+
 static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
 {
-    struct spi_buf rx_buf = { .buf = dst, .len = IMG_W };
+    /* Keep EasyDMA on one fixed, aligned address.  Copying 324 bytes after a
+     * completed line easily fits inside the HM01B0 horizontal blanking time. */
+    struct spi_buf rx_buf = { .buf = probe_buf, .len = IMG_W };
     struct spi_buf_set rx_set = { .buffers = &rx_buf, .count = 1 };
-    struct spi_buf tx_buf = { .buf = dst, .len = IMG_W };
+    struct spi_buf tx_buf = { .buf = probe_buf, .len = IMG_W };
     struct spi_buf_set tx_set = { .buffers = &tx_buf, .count = 1 };
 
     if (spis_transfer_pending) {
@@ -430,6 +468,7 @@ static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
         LOG_ERR("spi_transceive_signal failed: %d", ret);
         return ret;
     }
+    spis_pending_destination = dst;
     spis_transfer_pending = true;
 
     struct k_poll_event evt;
@@ -438,7 +477,7 @@ static int spis_arm_and_wait(uint8_t *dst, k_timeout_t timeout)
 
     ret = k_poll(&evt, 1, timeout);
     if (ret == 0) {
-        spis_transfer_pending = false;
+        spis_complete_pending_transfer();
     }
     return ret;
 }
@@ -460,7 +499,7 @@ static int spis_wait_only(k_timeout_t timeout)
                       K_POLL_MODE_NOTIFY_ONLY, &line_done_sig);
     int ret = k_poll(&evt, 1, timeout);
     if (ret == 0) {
-        spis_transfer_pending = false;
+        spis_complete_pending_transfer();
     }
     return ret;
 }
@@ -509,12 +548,12 @@ int camera_capture_frame(void)
     int rc;
 
     /* A previous attempt may have timed out while the asynchronous SPIS
-     * transaction was still waiting for LVLD/CS. Drain that transaction
-     * before entering spi_transceive_signal(); otherwise Zephyr waits forever
-     * on its internal context lock and the capture thread never returns. */
+     * transaction was still waiting for LVLD/CS. Restart the signal source and
+     * finish that transaction before entering spi_transceive_signal(); otherwise
+     * Zephyr waits forever on its internal context lock. */
     if (spis_transfer_pending) {
-        LOG_WRN("Draining SPIS transaction left by the previous attempt");
-        rc = spis_drain_timed_out_transfer();
+        LOG_WRN("Recovering SPIS transaction left by the previous attempt");
+        rc = camera_recover_pending_transfer();
         if (rc != 0) {
             return -ETIMEDOUT;
         }
@@ -552,8 +591,10 @@ int camera_capture_frame(void)
     rc = spis_wait_only(K_MSEC(VBLANK_WAIT_MS));
     if (rc != 0) {
         LOG_WRN("Row 0 wait timed out (rc=%d); caller should retry", rc);
-        camera_diag_set(CAMERA_DIAG_ERROR, 0U, rc);
-        return -ETIMEDOUT;
+        int recover_rc = camera_recover_pending_transfer();
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U,
+                        recover_rc == 0 ? -EAGAIN : recover_rc);
+        return recover_rc == 0 ? -EAGAIN : -ETIMEDOUT;
     }
     memcpy(&frame_buf[0], probe_buf, IMG_W);
 
@@ -569,6 +610,9 @@ int camera_capture_frame(void)
                  * transaction armed. Drain it before returning so the retry
                  * is independent instead of inheriting a stale row. */
                 int drain_rc = spis_drain_timed_out_transfer();
+                if (drain_rc != 0) {
+                    drain_rc = camera_recover_pending_transfer();
+                }
                 if (drain_rc == 0) {
                     camera_diag_set(CAMERA_DIAG_ERROR, (uint8_t)line,
                                     -EAGAIN);
@@ -595,31 +639,47 @@ static void mclk_stop(void)
 
 int camera_standby(void)
 {
+    int first_err = 0;
+
     /* Give a pending line its final opportunity to complete while the camera
      * is still producing LVLD/CS. Never clear its completion signal while the
      * Zephyr SPIS driver still owns the transaction. */
     if (spis_transfer_pending) {
-        LOG_WRN("Draining pending SPIS transfer before camera standby");
-        (void)spis_drain_timed_out_transfer();
+        LOG_WRN("Recovering pending SPIS transfer before camera standby");
+        int recover_err = camera_recover_pending_transfer();
+        if (recover_err != 0) {
+            first_err = recover_err;
+        }
     }
 
-    int first_err = camera_write_reg(i2c_dev, 0x0100, 0x00);
-    if (first_err) {
-        LOG_ERR("Camera standby stream-off failed: %d", first_err);
+    int err = camera_write_reg(i2c_dev, 0x0100, 0x00);
+    if (err) {
+        LOG_ERR("Camera standby stream-off failed: %d", err);
+        if (first_err == 0) {
+            first_err = err;
+        }
     }
     k_msleep(10);
     mclk_stop();
     if (!spis_transfer_pending) {
         k_poll_signal_reset(&line_done_sig);
     }
-    int err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_SUSPEND);
-    if (err) {
-        LOG_ERR("Failed to suspend SPI Slave: %d", err);
-        if (first_err == 0) {
-            first_err = err;
+    if (!spis_transfer_pending) {
+        err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_SUSPEND);
+        if (err) {
+            LOG_ERR("Failed to suspend SPI Slave: %d", err);
+            if (first_err == 0) {
+                first_err = err;
+            }
         }
+    } else {
+        /* Suspending SPIS cannot cancel an asynchronous Zephyr transaction;
+         * it only removes the pins and makes recovery impossible. Keep SPIS
+         * alive so the next camera wake can finish the pending line. */
+        LOG_ERR("Leaving SPI Slave active because a transfer is still pending");
     }
-    LOG_INF("Camera Standby & SPI Slave Suspended");
+    LOG_INF("Camera Standby; SPI Slave %s",
+            spis_transfer_pending ? "kept active" : "suspended");
     camera_diag_set(CAMERA_DIAG_IDLE, 0U, first_err);
     return first_err;
 }
@@ -651,6 +711,129 @@ static int camera_start_streaming_with_retry(void)
     return err;
 }
 
+/* Zephyr's asynchronous SPIS API does not expose a safe cancellation call.
+ * A line transaction that times out therefore still owns the driver context.
+ * Recover by restoring the clock and restarting the sensor so that a genuine
+ * camera line completes that transaction and releases the driver normally.
+ */
+static int camera_recover_pending_transfer(void)
+{
+    if (!spis_transfer_pending) {
+        return 0;
+    }
+
+    camera_diag_set(CAMERA_DIAG_DRAINING_TRANSFER, 0U, -EAGAIN);
+    LOG_WRN("Camera recovery: restoring MCLK and restarting sensor stream");
+
+    int err = mclk_start();
+    if (err != 0) {
+        LOG_ERR("Camera recovery could not restore MCLK: %d", err);
+        return err;
+    }
+    k_msleep(CAMERA_MCLK_SETTLE_MS);
+
+    uint8_t mode_before = 0xFFU;
+    uint8_t frame_before = 0xFFU;
+    (void)camera_read_reg(0x0100, &mode_before);
+    (void)camera_read_reg(0x0005, &frame_before);
+
+    /* A clean standby-to-stream transition is enough for transient sensor
+     * stalls and preserves the current AE state. */
+    err = camera_write_reg(i2c_dev, 0x0100, 0x00);
+    if (err == 0) {
+        k_msleep(10);
+        err = camera_start_streaming_with_retry();
+    }
+    if (err == 0) {
+        k_msleep(CAMERA_RECOVERY_SETTLE_MS);
+        int drain_err = spis_wait_only(K_MSEC(VBLANK_WAIT_MS));
+        if (drain_err == 0) {
+            uint8_t frame_after = 0xFFU;
+            (void)camera_read_reg(0x0005, &frame_after);
+            LOG_INF("Camera recovery succeeded: mode=0x%02x frame=%u->%u",
+                    mode_before, frame_before, frame_after);
+            return 0;
+        }
+        LOG_WRN("Stream restart produced no SPIS line: %d", drain_err);
+    } else {
+        LOG_WRN("Camera stream restart failed during recovery: %d", err);
+    }
+
+    /* If the sensor lost configuration or browned out, reload the complete
+     * known-good table. It ends with MODE_SELECT=1, so the still-pending SPIS
+     * request can complete as soon as the first new line is emitted. */
+    LOG_WRN("Camera recovery: reloading complete register table");
+    err = camera_load_regs(i2c_dev, hm01b0_324x244);
+    if (err != 0) {
+        LOG_ERR("Camera register reload failed during recovery: %d", err);
+        return err;
+    }
+    k_msleep(CAMERA_RECOVERY_SETTLE_MS);
+
+    err = spis_wait_only(K_MSEC(VBLANK_WAIT_MS));
+    if (err != 0) {
+        uint8_t mode_after = 0xFFU;
+        uint8_t frame_after = 0xFFU;
+        int mode_err = camera_read_reg(0x0100, &mode_after);
+        int frame_err = camera_read_reg(0x0005, &frame_after);
+        LOG_ERR("Camera recovery failed: SPIS=%d mode=0x%02x(%d) "
+                "frame=%u(%d)", err, mode_after, mode_err,
+                frame_after, frame_err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return -ETIMEDOUT;
+    }
+
+    uint8_t frame_after = 0xFFU;
+    (void)camera_read_reg(0x0005, &frame_after);
+    LOG_INF("Camera recovery succeeded after register reload: frame=%u->%u",
+            frame_before, frame_after);
+    return 0;
+}
+
+/* Put the sensor back at a clean frame boundary after a complete capture
+ * burst has exhausted its sync retries.  This is intentionally separate from
+ * camera_recover_pending_transfer(): a drained transaction can release the
+ * Zephyr driver correctly while the HM01B0 stream itself is still out of the
+ * state expected by the next trigger. */
+int camera_recover_stream(void)
+{
+    if (spis_transfer_pending) {
+        return camera_recover_pending_transfer();
+    }
+
+    LOG_WRN("Camera recovery: restarting stream after capture failure");
+    int err = mclk_start();
+    if (err != 0) {
+        return err;
+    }
+    k_msleep(CAMERA_MCLK_SETTLE_MS);
+
+    uint8_t frame_before = 0xFFU;
+    (void)camera_read_reg(0x0005, &frame_before);
+
+    err = camera_write_reg(i2c_dev, 0x0100, 0x00);
+    if (err == 0) {
+        k_msleep(10);
+        err = camera_start_streaming_with_retry();
+    }
+    if (err != 0) {
+        LOG_WRN("Camera stream restart failed; reloading register table: %d",
+                err);
+        err = camera_load_regs(i2c_dev, hm01b0_324x244);
+    }
+    if (err != 0) {
+        LOG_ERR("Camera recovery after capture failure failed: %d", err);
+        return err;
+    }
+
+    k_msleep(CAMERA_RECOVERY_SETTLE_MS);
+    uint8_t frame_after = 0xFFU;
+    (void)camera_read_reg(0x0005, &frame_after);
+    LOG_INF("Camera stream recovered after capture failure: frame=%u->%u",
+            frame_before, frame_after);
+    return 0;
+}
+
 int camera_wake_up(void)
 {
     LOG_INF("Waking up Camera, MCLK & SPI Slave...");
@@ -660,7 +843,11 @@ int camera_wake_up(void)
         return err;
     }
 
-    NRF_TIMER_REG->TASKS_START = 1;
+    err = mclk_start();
+    if (err != 0) {
+        LOG_ERR("Failed to restore camera MCLK: %d", err);
+        return err;
+    }
     k_msleep(CAMERA_MCLK_SETTLE_MS);
 
     err = camera_start_streaming_with_retry();

@@ -40,7 +40,8 @@ static volatile uint32_t diagnostic_attempt_id;
 static volatile uint16_t diagnostic_distance_mm;
 static volatile uint8_t diagnostic_burst_frame;
 
-#define CAMERA_DIAGNOSTIC_INTERVAL_MS 500U
+#define CAMERA_DIAGNOSTIC_INITIAL_DELAY_MS 1500U
+#define CAMERA_DIAGNOSTIC_INTERVAL_MS 1000U
 #define CAMERA_DIAGNOSTIC_WORK_QUEUE_PRIORITY 5
 #define CAMERA_DIAGNOSTIC_WORK_QUEUE_STACK_SIZE 1024
 
@@ -86,7 +87,8 @@ static void camera_diagnostics_start(uint32_t attempt_id,
     ARG_UNUSED(total_frames);
     camera_diagnostics_active = true;
     (void)k_work_reschedule_for_queue(&camera_diagnostic_work_queue,
-                                     &camera_diagnostic_work, K_MSEC(100));
+                                     &camera_diagnostic_work,
+                                     K_MSEC(CAMERA_DIAGNOSTIC_INITIAL_DELAY_MS));
 }
 
 static void camera_diagnostics_stop(void)
@@ -309,6 +311,10 @@ static void handle_capture_trigger(void)
         struct camera_diagnostic_snapshot snapshot;
         camera_get_diagnostic_snapshot(&snapshot);
         LOG_ERR("Camera capture failed: %d", length);
+        int recovery_err = camera_recover_stream();
+        if (recovery_err != 0) {
+            LOG_ERR("Post-failure camera recovery failed: %d", recovery_err);
+        }
         ble_publish_capture_status(CAPTURE_STATUS_CAMERA_ERROR,
                                    attempt_id, distance_mm,
                                    (int16_t)length, snapshot.row,

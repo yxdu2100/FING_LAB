@@ -245,7 +245,7 @@ struct CaptureStudyView: View {
         case 2: "searching for vertical blank (probe \(row))"
         case 3: "waiting for sensor row 0"
         case 4: "receiving row \(row) of 244"
-        case 5: "draining a timed-out SPI transaction"
+        case 5: "recovering the camera stream after a timed-out SPI transaction"
         case 6: "frame acquisition complete"
         case 7: "camera capture returned an error at row \(row)"
         default: "unknown camera stage \(stage), row \(row)"

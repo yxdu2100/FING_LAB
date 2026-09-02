@@ -28,6 +28,7 @@ int camera_init(void);
 int camera_standby(void);
 int camera_capture_frame(void);
 int camera_wake_up(void);
+int camera_recover_stream(void);
 int camera_log_ae_state(unsigned int burst_frame);
 void camera_get_diagnostic_snapshot(struct camera_diagnostic_snapshot *snapshot);
 uint8_t *camera_get_frame_buffer(void);

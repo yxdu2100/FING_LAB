@@ -10,19 +10,19 @@
  *
  * The current sensor timing is 800 pixel clocks per row at a 1 MHz video
  * timing clock, or approximately 0.8 ms per integration row.  Therefore
- * 62 rows limits motion-producing exposure to approximately 50 ms.  When
+ * 30 rows limits motion-producing exposure to approximately 24 ms.  When
  * changing the line timing in hm01b0_init.h, recalculate these row values.
  *
  * Analog gain codes are power-of-two limits: 0=1x, 1=2x, 2=4x, 3=8x.
  * Digital gain uses 2.6 fixed point: 0x40=1x, 0x80=2x, 0xC0=3x.
  */
-#define CAMERA_AE_TARGET_MEAN              0x50U
+#define CAMERA_AE_TARGET_MEAN              0x40U
 #define CAMERA_LINE_LENGTH_PCK             800U
 #define CAMERA_FRAME_LENGTH_LINES          313U
-#define CAMERA_AE_MAX_INTEGRATION_ROWS     62U
+#define CAMERA_AE_MAX_INTEGRATION_ROWS     30U
 #define CAMERA_AE_MIN_INTEGRATION_ROWS     2U
 #define CAMERA_AE_MAX_ANALOG_GAIN_CODE     0x03U
-#define CAMERA_AE_MAX_DIGITAL_GAIN_CODE    0x80U
+#define CAMERA_AE_MAX_DIGITAL_GAIN_CODE    0x60U
 #define CAMERA_AE_DAMPING_FACTOR           0x20U
 
 /* Indoor-light flicker avoidance for the present 800 us row time. */

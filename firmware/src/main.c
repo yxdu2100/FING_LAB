@@ -16,7 +16,8 @@ int main(void)
     }
 
     err = ble_init(mode_manager_request, mode_manager_request_resend,
-                   mode_manager_acknowledge_frame);
+                   mode_manager_acknowledge_frame,
+                   mode_manager_request_camera_recovery);
     if (err != 0) {
         LOG_ERR("BLE initialization failed: %d", err);
         return err;

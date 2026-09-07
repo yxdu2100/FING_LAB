@@ -21,6 +21,7 @@ LOG_MODULE_REGISTER(mode_manager, LOG_LEVEL_INF);
 #define EVENT_CAPTURE_TRIGGER BIT(1)
 #define EVENT_RESEND_REQUEST BIT(2)
 #define EVENT_FRAME_ACK BIT(3)
+#define EVENT_CAMERA_RECOVERY_REQUEST BIT(4)
 
 K_EVENT_DEFINE(mode_events);
 
@@ -169,7 +170,8 @@ static int capture_ae_stabilized_frame(uint32_t attempt_id,
         /* The BLE callback updates requested_mode immediately, even while the
          * mode-manager thread is inside this blocking burst.  Check it between
          * frames so IDLE does not have to wait for the complete burst. */
-        if (requested_mode != FING_MODE_CAPTURE) {
+        if (requested_mode != FING_MODE_CAPTURE ||
+            ble_is_camera_recovery_requested()) {
             LOG_INF("AE burst cancelled after %u/%u frames",
                     frame - 1U, total_frames);
             return -ECANCELED;
@@ -442,6 +444,58 @@ static void handle_frame_ack(void)
     LOG_INF("App confirmed frame %u was saved", frame_id);
 }
 
+static void handle_camera_recovery_request(void)
+{
+    uint32_t attempt_id = capture_attempt_id;
+
+    /* The BLE callback only posts this event. Camera/IMU ownership remains in
+     * this mode-manager thread, serialized with capture and mode changes. */
+    if (active_mode != FING_MODE_CAPTURE ||
+        requested_mode != FING_MODE_CAPTURE) {
+        LOG_WRN("Ignoring camera recovery outside CAPTURE mode");
+        ble_publish_capture_status(CAPTURE_STATUS_CAMERA_RECOVERY_FAILED,
+                                   attempt_id,
+                                   CAPTURE_STATUS_DISTANCE_UNKNOWN,
+                                   -EACCES, 0, 0);
+        ble_camera_recovery_request_handled();
+        return;
+    }
+
+    LOG_WRN("Operator requested camera recovery");
+    camera_diagnostics_stop();
+    imu_stop_capture_detector();
+    ble_publish_capture_status(CAPTURE_STATUS_CAMERA_RECOVERY_STARTED,
+                               attempt_id,
+                               CAPTURE_STATUS_DISTANCE_UNKNOWN,
+                               0, 0, 0);
+
+    int camera_err = camera_recover_pipeline();
+    int detector_err = 0;
+    if (active_mode == FING_MODE_CAPTURE &&
+        requested_mode == FING_MODE_CAPTURE) {
+        detector_err = imu_start_capture_detector();
+    }
+
+    int result = camera_err != 0 ? camera_err : detector_err;
+    if (result == 0) {
+        last_transfer_failed = false;
+        ble_publish_capture_status(CAPTURE_STATUS_CAMERA_RECOVERY_COMPLETE,
+                                   attempt_id,
+                                   CAPTURE_STATUS_DISTANCE_UNKNOWN,
+                                   0, 0, 0);
+        LOG_INF("Capture pipeline recovered and detector rearmed");
+    } else {
+        ble_publish_capture_status(CAPTURE_STATUS_CAMERA_RECOVERY_FAILED,
+                                   attempt_id,
+                                   CAPTURE_STATUS_DISTANCE_UNKNOWN,
+                                   (int16_t)result, 0, 0);
+        LOG_ERR("Manual capture-pipeline recovery failed: camera=%d detector=%d",
+                camera_err, detector_err);
+    }
+
+    ble_camera_recovery_request_handled();
+}
+
 int mode_manager_init(void)
 {
     k_work_queue_start(&camera_diagnostic_work_queue,
@@ -498,18 +552,32 @@ void mode_manager_acknowledge_frame(uint32_t frame_id)
     k_event_post(&mode_events, EVENT_FRAME_ACK);
 }
 
+void mode_manager_request_camera_recovery(void)
+{
+    /* This public posting function is also the extension point for a future
+     * automatic stall monitor. It deliberately contains no recovery logic. */
+    k_event_post(&mode_events, EVENT_CAMERA_RECOVERY_REQUEST);
+}
+
 void mode_manager_run(void)
 {
     while (true) {
         uint32_t events = k_event_wait(&mode_events,
                                        EVENT_MODE_REQUEST | EVENT_CAPTURE_TRIGGER |
-                                           EVENT_RESEND_REQUEST | EVENT_FRAME_ACK,
+                                           EVENT_RESEND_REQUEST | EVENT_FRAME_ACK |
+                                           EVENT_CAMERA_RECOVERY_REQUEST,
                                        true, K_FOREVER);
 
         /* Mode changes take priority, preventing a stale gesture from starting
          * capture after the app has requested the streaming profile. */
         if ((events & EVENT_MODE_REQUEST) != 0U) {
             transition_to(requested_mode);
+        }
+        if ((events & EVENT_CAMERA_RECOVERY_REQUEST) != 0U) {
+            handle_camera_recovery_request();
+            /* A gesture already queued before the button was pressed belongs
+             * to the discarded pipeline state and must not capture at once. */
+            events &= ~EVENT_CAPTURE_TRIGGER;
         }
         if ((events & EVENT_CAPTURE_TRIGGER) != 0U) {
             handle_capture_trigger();

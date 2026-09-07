@@ -22,6 +22,8 @@ enum BLEConstants {
     static let commandKeepalive: UInt8 = 3
     static let commandResendLastImage: UInt8 = 4
     static let commandAcknowledgeFrame: UInt8 = 5
+    static let commandRecoverCamera: UInt8 = 6
+    // UInt8(7) is reserved for a future explicit full-MCU restart command.
 
     static let samplePayloadLength = 23
     static let maxSamplesPerPacket = 7

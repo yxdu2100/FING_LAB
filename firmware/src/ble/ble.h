@@ -15,6 +15,7 @@ enum fing_mode {
 typedef void (*ble_mode_request_callback_t)(enum fing_mode requested_mode);
 typedef void (*ble_resend_request_callback_t)(void);
 typedef void (*ble_frame_ack_callback_t)(uint32_t frame_id);
+typedef void (*ble_camera_recovery_callback_t)(void);
 
 enum capture_status_event {
     CAPTURE_STATUS_WAITING = 0,
@@ -34,6 +35,9 @@ enum capture_status_event {
     CAPTURE_STATUS_RESEND_STARTED = 14,
     CAPTURE_STATUS_AWAITING_APP_ACK = 15,
     CAPTURE_STATUS_CAMERA_DIAGNOSTIC = 16,
+    CAPTURE_STATUS_CAMERA_RECOVERY_STARTED = 17,
+    CAPTURE_STATUS_CAMERA_RECOVERY_COMPLETE = 18,
+    CAPTURE_STATUS_CAMERA_RECOVERY_FAILED = 19,
 };
 
 #define CAPTURE_STATUS_DISTANCE_UNKNOWN UINT16_MAX
@@ -58,7 +62,8 @@ struct bt_app_imu_sample {
 
 int ble_init(ble_mode_request_callback_t mode_callback,
              ble_resend_request_callback_t resend_callback,
-             ble_frame_ack_callback_t frame_ack_callback);
+             ble_frame_ack_callback_t frame_ack_callback,
+             ble_camera_recovery_callback_t camera_recovery_callback);
 void ble_set_active_mode(enum fing_mode mode);
 void ble_set_preferred_phy(enum fing_mode mode);
 enum fing_mode ble_get_active_mode(void);
@@ -72,6 +77,8 @@ void ble_publish_capture_status(enum capture_status_event event,
                                 uint8_t total);
 
 bool ble_can_send_frame(void);
+bool ble_is_camera_recovery_requested(void);
+void ble_camera_recovery_request_handled(void);
 int ble_send_frame(const uint8_t *frame, size_t length,
                    uint32_t frame_id, uint32_t timestamp_ms);
 void ble_send_imu_samples(const struct bt_app_imu_sample *samples,

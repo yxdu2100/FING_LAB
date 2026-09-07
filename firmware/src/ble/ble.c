@@ -36,6 +36,10 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define CONTROL_KEEPALIVE 3U
 #define CONTROL_RESEND_LAST_IMAGE 4U
 #define CONTROL_ACK_FRAME 5U
+#define CONTROL_RECOVER_CAMERA 6U
+/* Command 7 is intentionally left available for a future full-MCU restart.
+ * The manual camera recovery implemented here never reboots the board. */
+#define CONTROL_RESTART_MCU_RESERVED 7U
 #define CAPTURE_STATUS_PACKET_LENGTH 16U
 #define CAPTURE_STATUS_VERSION 1U
 
@@ -79,9 +83,11 @@ static char device_info_value[64];
 static uint8_t advertising_restart_attempts;
 static uint8_t status_notify_attempts;
 static volatile uint8_t control_requested_mode = FING_MODE_IDLE;
+static volatile bool camera_recovery_requested;
 static ble_mode_request_callback_t mode_request_callback;
 static ble_resend_request_callback_t resend_request_callback;
 static ble_frame_ack_callback_t frame_ack_callback;
+static ble_camera_recovery_callback_t camera_recovery_request_callback;
 
 static void image_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -176,6 +182,18 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
     if (command == CONTROL_RESEND_LAST_IMAGE) {
         if (resend_request_callback != NULL) {
             resend_request_callback();
+        }
+        return len;
+    }
+    if (command == CONTROL_RECOVER_CAMERA) {
+        /* This flag also stops a BLE image notification loop promptly. The
+         * mode-manager owns the actual recovery and clears it when done. */
+        camera_recovery_requested = true;
+        LOG_INF("App requested camera recovery");
+        if (camera_recovery_request_callback != NULL) {
+            camera_recovery_request_callback();
+        } else {
+            camera_recovery_requested = false;
         }
         return len;
     }
@@ -393,6 +411,7 @@ static void disconnected(struct bt_conn *connection, uint8_t reason)
     imu_notifications_enabled = false;
     capture_status_notifications_enabled = false;
     control_requested_mode = FING_MODE_IDLE;
+    camera_recovery_requested = false;
     (void)k_work_cancel_delayable(&status_notify_work);
     (void)k_work_cancel_delayable(&capture_status_notify_work);
     if (current_connection != NULL) {
@@ -412,11 +431,13 @@ BT_CONN_CB_DEFINE(connection_callbacks) = {
 
 int ble_init(ble_mode_request_callback_t callback,
              ble_resend_request_callback_t resend_callback,
-             ble_frame_ack_callback_t ack_callback)
+             ble_frame_ack_callback_t ack_callback,
+             ble_camera_recovery_callback_t recovery_callback)
 {
     mode_request_callback = callback;
     resend_request_callback = resend_callback;
     frame_ack_callback = ack_callback;
+    camera_recovery_request_callback = recovery_callback;
     (void)snprintf(device_info_value, sizeof(device_info_value),
                    "1|%s|%d|%s", CONFIG_FING_BOARD_ID,
                    CONFIG_FING_RING_SIZE_MM, CONFIG_FING_FIRMWARE_VERSION);
@@ -509,7 +530,18 @@ bool ble_can_send_frame(void)
 {
     return status_value == FING_MODE_CAPTURE && current_connection != NULL &&
            image_notifications_enabled &&
-           control_requested_mode == FING_MODE_CAPTURE;
+           control_requested_mode == FING_MODE_CAPTURE &&
+           !camera_recovery_requested;
+}
+
+bool ble_is_camera_recovery_requested(void)
+{
+    return camera_recovery_requested;
+}
+
+void ble_camera_recovery_request_handled(void)
+{
+    camera_recovery_requested = false;
 }
 
 static int notify_image_with_retry(const uint8_t *data, uint16_t length)
@@ -531,6 +563,9 @@ static int notify_image_with_retry(const uint8_t *data, uint16_t length)
         k_usleep(NOTIFY_RETRY_SLEEP_US);
     }
     if (control_requested_mode != FING_MODE_CAPTURE) {
+        return -ECANCELED;
+    }
+    if (camera_recovery_requested) {
         return -ECANCELED;
     }
     return -ENOTCONN;

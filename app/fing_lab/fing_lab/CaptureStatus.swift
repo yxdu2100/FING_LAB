@@ -18,6 +18,9 @@ enum CaptureStatusEvent: UInt8, Sendable {
     case resendStarted = 14
     case awaitingAppAcknowledgement = 15
     case cameraDiagnostic = 16
+    case cameraRecoveryStarted = 17
+    case cameraRecoveryComplete = 18
+    case cameraRecoveryFailed = 19
 
     var title: String {
         switch self {
@@ -38,6 +41,9 @@ enum CaptureStatusEvent: UInt8, Sendable {
         case .resendStarted: "Resending image"
         case .awaitingAppAcknowledgement: "Confirming image save"
         case .cameraDiagnostic: "Camera diagnostic"
+        case .cameraRecoveryStarted: "Recovering camera"
+        case .cameraRecoveryComplete: "Camera recovered"
+        case .cameraRecoveryFailed: "Camera recovery failed"
         }
     }
 
@@ -58,12 +64,15 @@ enum CaptureStatusEvent: UInt8, Sendable {
         case .cancelled: "xmark.circle"
         case .resendAvailable: "arrow.clockwise.circle"
         case .cameraDiagnostic: "waveform.path.ecg"
+        case .cameraRecoveryStarted: "arrow.clockwise.circle"
+        case .cameraRecoveryComplete: "checkmark.circle.fill"
+        case .cameraRecoveryFailed: "exclamationmark.triangle"
         }
     }
 
     var isError: Bool {
         switch self {
-        case .tofError, .transferFailed, .cameraError: true
+        case .tofError, .transferFailed, .cameraError, .cameraRecoveryFailed: true
         default: false
         }
     }

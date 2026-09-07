@@ -45,6 +45,7 @@ static uint8_t frame_buf[FRAME_BYTES];
 #define CAMERA_INIT_RETRIES 10
 #define CAMERA_INIT_RETRY_DELAY_MS 100
 #define CAMERA_RECOVERY_SETTLE_MS 100
+#define CAMERA_RECOVERY_VERIFY_MS 600
 
 /* Fixed SPIS EasyDMA staging buffer.
  *
@@ -940,6 +941,101 @@ int camera_recover_stream(void)
     uint8_t frame_after = 0xFFU;
     (void)camera_read_reg(0x0005, &frame_after);
     LOG_INF("Camera stream recovered after capture failure: frame=%u->%u",
+            frame_before, frame_after);
+    return 0;
+}
+
+int camera_recover_pipeline(void)
+{
+    LOG_WRN("Manual camera recovery: refreshing capture pipeline");
+    camera_diag_set(CAMERA_DIAG_DRAINING_TRANSFER, 0U, 0);
+
+    int err = mclk_start();
+    if (err != 0) {
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+
+    err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_RESUME);
+    if (err != 0 && err != -EALREADY) {
+        LOG_ERR("Manual recovery could not resume SPI Slave: %d", err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+    k_msleep(CAMERA_MCLK_SETTLE_MS);
+
+    /* Zephyr's SPIS context must be released by a real sensor transaction.
+     * Generate clocked frames first; only reset the peripheral after the
+     * outstanding callback has completed and released its buffers. */
+    if (spis_transfer_pending) {
+        err = camera_recover_pending_transfer();
+        if (err != 0) {
+            LOG_ERR("Manual recovery could not drain pending SPIS: %d", err);
+            camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+            return err;
+        }
+    }
+
+    err = camera_write_reg(i2c_dev, 0x0100, 0x00);
+    if (err != 0) {
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+    k_msleep(10);
+
+    /* With no asynchronous transfer outstanding, suspend/resume restores the
+     * SPIS pins and hardware to the same state as a fresh CAPTURE entry. */
+    err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_SUSPEND);
+    if (err != 0 && err != -EALREADY) {
+        LOG_ERR("Manual recovery could not suspend SPI Slave: %d", err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+    k_msleep(10);
+    err = pm_device_action_run(spi_slave_dev, PM_DEVICE_ACTION_RESUME);
+    if (err != 0 && err != -EALREADY) {
+        LOG_ERR("Manual recovery could not restore SPI Slave: %d", err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+    k_poll_signal_reset(&line_done_sig);
+    spis_pending_destination = NULL;
+
+    /* The table starts with the HM01B0 software reset and ends in streaming
+     * mode. A complete rewrite prevents stale AE/timing state from surviving
+     * an operator-requested refresh. */
+    err = camera_load_regs(i2c_dev, hm01b0_324x244);
+    if (err != 0) {
+        LOG_ERR("Manual recovery register reload failed: %d", err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+    k_msleep(CAMERA_RECOVERY_SETTLE_MS);
+
+    err = camera_ensure_streaming();
+    if (err != 0) {
+        LOG_ERR("Manual recovery could not start sensor stream: %d", err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, err);
+        return err;
+    }
+
+    uint8_t frame_before = 0xFFU;
+    uint8_t frame_after = 0xFFU;
+    err = camera_read_reg(0x0005, &frame_before);
+    if (err == 0) {
+        k_msleep(CAMERA_RECOVERY_VERIFY_MS);
+        err = camera_read_reg(0x0005, &frame_after);
+    }
+    if (err != 0 || frame_after == frame_before) {
+        int result = err != 0 ? err : -ETIMEDOUT;
+        LOG_ERR("Manual recovery frame verification failed: %u->%u err=%d",
+                frame_before, frame_after, err);
+        camera_diag_set(CAMERA_DIAG_ERROR, 0U, result);
+        return result;
+    }
+
+    camera_diag_set(CAMERA_DIAG_IDLE, 0U, 0);
+    LOG_INF("Manual camera recovery complete: frame=%u->%u",
             frame_before, frame_after);
     return 0;
 }

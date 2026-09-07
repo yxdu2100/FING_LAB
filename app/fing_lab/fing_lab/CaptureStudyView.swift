@@ -101,6 +101,29 @@ struct CaptureStudyView: View {
                 }
             }
 
+            Button {
+                coordinator.ble.recoverCamera()
+            } label: {
+                HStack {
+                    if coordinator.ble.isCameraRecoveryInProgress {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise.circle")
+                    }
+                    Text(coordinator.ble.isCameraRecoveryInProgress
+                         ? "Recovering Camera…"
+                         : "Recover Camera")
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(
+                !coordinator.ble.connectionState.isConnected ||
+                coordinator.ble.activeMode != .capture ||
+                coordinator.ble.isCameraRecoveryInProgress
+            )
+
             if !coordinator.ble.captureStatusHistory.isEmpty {
                 DisclosureGroup("Recent capture events") {
                     VStack(alignment: .leading, spacing: 8) {
@@ -224,6 +247,12 @@ struct CaptureStudyView: View {
                 ? ""
                 : " Last camera result: \(status.detail)."
             return "AE frame \(burstFrame)/4: \(stageText). Firmware time \(status.deviceTimestampMs) ms.\(errorText)"
+        case .cameraRecoveryStarted:
+            return "Stopping capture, resetting SPI, and reloading the complete camera configuration."
+        case .cameraRecoveryComplete:
+            return "The camera stream was verified and gesture detection is armed again."
+        case .cameraRecoveryFailed:
+            return "The camera could not be recovered (firmware error \(status.detail)). Power-cycle the ring if capture remains unavailable."
         }
     }
 
@@ -231,9 +260,9 @@ struct CaptureStudyView: View {
         switch event {
         case .waiting: .secondary
         case .tofRejected, .cancelled, .resendAvailable: .orange
-        case .tofError, .transferFailed, .cameraError: .red
-        case .cameraDiagnostic: .purple
-        case .transferComplete: .green
+        case .tofError, .transferFailed, .cameraError, .cameraRecoveryFailed: .red
+        case .cameraDiagnostic, .cameraRecoveryStarted: .purple
+        case .transferComplete, .cameraRecoveryComplete: .green
         default: .blue
         }
     }

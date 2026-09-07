@@ -11,6 +11,7 @@ final class RingBLEManager: NSObject {
     var errorMessage: String?
     var latestCaptureStatus: CaptureStatus = .waiting
     var captureStatusHistory: [CaptureStatus] = []
+    var isCameraRecoveryInProgress = false
     var discoveredDevices: [DiscoveredRingDevice] = []
     var connectedDeviceIdentity: RingDeviceIdentity?
 
@@ -68,6 +69,7 @@ final class RingBLEManager: NSObject {
     private var pendingSwitchIdentifier: UUID?
     private var modeAfterSwitch: FirmwareMode = .idle
     private var switchTimeoutWorkItem: DispatchWorkItem?
+    private var cameraRecoveryTimeoutWorkItem: DispatchWorkItem?
 
     private enum DefaultsKey {
         static let selectedPeripheralID = "FingLab.selectedPeripheralID"
@@ -210,6 +212,31 @@ final class RingBLEManager: NSObject {
     func enterCaptureMode() { requestMode(.capture) }
     func enterIdleMode() { requestMode(.idle) }
     func resendLastImage() { writeCommand(BLEConstants.commandResendLastImage) }
+
+    func recoverCamera() {
+        guard connectionState.isConnected, activeMode == .capture else {
+            errorMessage = "Connect to the ring in capture mode before recovering the camera."
+            return
+        }
+        guard !isCameraRecoveryInProgress else { return }
+
+        /* Any partial Bayer frame belongs to the failed pipeline and must not
+         * be combined with packets received after recovery. */
+        frameReassembler.reset()
+        isCameraRecoveryInProgress = true
+        writeCommand(BLEConstants.commandRecoverCamera)
+
+        // This only restores the button if firmware cannot answer. It does
+        // not initiate automatic recovery or reboot the MCU.
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.isCameraRecoveryInProgress else { return }
+            self.isCameraRecoveryInProgress = false
+            self.errorMessage = "The ring did not report a camera recovery result."
+        }
+        cameraRecoveryTimeoutWorkItem?.cancel()
+        cameraRecoveryTimeoutWorkItem = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: timeout)
+    }
 
     func acknowledgeFrame(_ frameID: UInt32) {
         var data = Data([BLEConstants.commandAcknowledgeFrame])
@@ -479,6 +506,9 @@ extension RingBLEManager: CBCentralManagerDelegate {
         frameReassembler.reset()
         activeMode = .idle
         isStreaming = false
+        isCameraRecoveryInProgress = false
+        cameraRecoveryTimeoutWorkItem?.cancel()
+        cameraRecoveryTimeoutWorkItem = nil
         connectedDeviceIdentity = nil
         stopKeepalive()
         connectionState = .disconnected
@@ -503,7 +533,10 @@ extension RingBLEManager: CBPeripheralDelegate {
                     error: Error?) {
         guard characteristic.uuid == BLEConstants.commandUUID,
               let error else { return }
-        errorMessage = "Could not send firmware mode command: \(error.localizedDescription)"
+        isCameraRecoveryInProgress = false
+        cameraRecoveryTimeoutWorkItem?.cancel()
+        cameraRecoveryTimeoutWorkItem = nil
+        errorMessage = "Could not send firmware command: \(error.localizedDescription)"
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -599,6 +632,16 @@ extension RingBLEManager: CBPeripheralDelegate {
         if characteristic.uuid == BLEConstants.captureStatusUUID {
             guard let status = CaptureStatus(data: data) else { return }
             latestCaptureStatus = status
+            switch status.event {
+            case .cameraRecoveryStarted:
+                isCameraRecoveryInProgress = true
+            case .cameraRecoveryComplete, .cameraRecoveryFailed:
+                isCameraRecoveryInProgress = false
+                cameraRecoveryTimeoutWorkItem?.cancel()
+                cameraRecoveryTimeoutWorkItem = nil
+            default:
+                break
+            }
             onCaptureStatusReceived?(status)
             if status.event == .cameraDiagnostic,
                let previous = captureStatusHistory.first,

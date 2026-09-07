@@ -25,7 +25,9 @@ enum FeedbackManager {
 
     static func imageTransferStarted() {
         notification.notificationOccurred(.success)
-        AudioServicesPlaySystemSound(1057)
+
+        // Use the brief iOS camera-shutter cue when image transfer begins.
+        AudioServicesPlaySystemSound(1108)
     }
 
     static func blockStart() {

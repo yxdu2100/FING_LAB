@@ -1,7 +1,14 @@
 #include <zephyr/logging/log.h>
-
 #include "ble/ble.h"
 #include "modes/mode_manager.h"
+#include <zephyr/toolchain.h>
+
+BUILD_ASSERT(sizeof(CONFIG_FING_BOARD_ID) > 1,
+             "No ring profile selected. Build with "
+             "-DEXTRA_CONF_FILE=configs/fing_NNmm.conf");
+BUILD_ASSERT(CONFIG_FING_RING_SIZE_MM > 0,
+             "No ring profile selected. Build with "
+             "-DEXTRA_CONF_FILE=configs/fing_NNmm.conf");
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20.0)
 # Keep Zephyr's generated compiler-capability cache inside the selected build
 # directory. This also makes command-line builds independent of host cache access.
 set(USER_CACHE_DIR "${CMAKE_BINARY_DIR}/.cache" CACHE PATH "Zephyr user cache")
+list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(fing_lab_capture)

@@ -1,0 +1,8 @@
+board:
+  name: nrf54v1
+  vendor: nrf54l15
+  socs:
+  - name: nrf54l15
+    variants:
+    - name: xip
+      cpucluster: cpuflpr

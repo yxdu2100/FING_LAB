@@ -1,5 +1,10 @@
 {
     "nrf-connect.applications": [
         "${workspaceFolder}/firmware/"
+    ],
+    // Board definitions live in <repo>/boards/nrf54v1. BOARD_ROOT must name the
+    // directory CONTAINING boards/, not the boards/ directory itself.
+    "nrf-connect.boardRoots": [
+        "${workspaceFolder}"
     ]
 }

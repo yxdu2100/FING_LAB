@@ -35,6 +35,10 @@ static uint32_t last_frame_timestamp_ms;
 static uint16_t last_frame_distance_mm = CAPTURE_STATUS_DISTANCE_UNKNOWN;
 static bool last_frame_valid;
 static bool last_transfer_failed;
+/* True only while CAPTURE has an awake camera and an armed gesture detector.
+ * A same-mode CAPTURE request uses it to choose between re-announcing and
+ * rebuilding the pipeline. */
+static bool capture_pipeline_ready;
 static volatile uint32_t acknowledged_frame_id;
 static volatile bool camera_diagnostics_active;
 static volatile uint32_t diagnostic_attempt_id;
@@ -207,6 +211,7 @@ static void enter_idle(void)
         imu_stream_stop();
     }
 
+    capture_pipeline_ready = false;
     active_mode = FING_MODE_IDLE;
     ble_set_active_mode(active_mode);
     ble_set_preferred_phy(active_mode);
@@ -247,6 +252,7 @@ static int enter_mode(enum fing_mode target)
     ble_set_active_mode(active_mode);
     ble_set_preferred_phy(active_mode);
     if (target == FING_MODE_CAPTURE) {
+        capture_pipeline_ready = true;
         publish_capture_readiness();
     }
     LOG_INF("Mode is %s", target == FING_MODE_CAPTURE ? "CAPTURE" : "STREAM");
@@ -255,7 +261,13 @@ static int enter_mode(enum fing_mode target)
 
 static void transition_to(enum fing_mode target)
 {
-    if (target == active_mode) {
+    /* A same-mode CAPTURE request normally only re-announces state. If a
+     * failed recovery left the camera or detector down, rebuild the pipeline
+     * exactly as IDLE -> CAPTURE would. */
+    bool rebuild_capture = target == FING_MODE_CAPTURE &&
+                           !capture_pipeline_ready;
+
+    if (target == active_mode && !rebuild_capture) {
         ble_set_active_mode(active_mode);
         ble_set_preferred_phy(active_mode);
         if (active_mode == FING_MODE_CAPTURE) {
@@ -310,6 +322,12 @@ static void handle_capture_trigger(void)
     ble_publish_capture_status(CAPTURE_STATUS_TOF_ACCEPTED,
                                attempt_id, distance_mm, 0, 0, 0);
 
+    /* The AE burst writes into the single shared frame buffer: every settling
+     * frame, and any attempt that fails after row 0, overwrites the retained
+     * frame. From here on no older frame can be resent. */
+    last_frame_valid = false;
+    last_transfer_failed = false;
+
     camera_diagnostics_start(attempt_id, distance_mm,
                              CAMERA_AE_DISCARD_FRAMES + 1U);
 
@@ -330,6 +348,7 @@ static void handle_capture_trigger(void)
         int recovery_err = camera_recover_stream();
         if (recovery_err != 0) {
             LOG_ERR("Post-failure camera recovery failed: %d", recovery_err);
+            capture_pipeline_ready = false;
         }
         ble_publish_capture_status(CAPTURE_STATUS_CAMERA_ERROR,
                                    attempt_id, distance_mm,
@@ -464,6 +483,7 @@ static void handle_camera_recovery_request(void)
     LOG_WRN("Operator requested camera recovery");
     camera_diagnostics_stop();
     imu_stop_capture_detector();
+    capture_pipeline_ready = false;
     ble_publish_capture_status(CAPTURE_STATUS_CAMERA_RECOVERY_STARTED,
                                attempt_id,
                                CAPTURE_STATUS_DISTANCE_UNKNOWN,
@@ -474,6 +494,7 @@ static void handle_camera_recovery_request(void)
     if (active_mode == FING_MODE_CAPTURE &&
         requested_mode == FING_MODE_CAPTURE) {
         detector_err = imu_start_capture_detector();
+        capture_pipeline_ready = camera_err == 0 && detector_err == 0;
     }
 
     int result = camera_err != 0 ? camera_err : detector_err;
@@ -561,17 +582,23 @@ void mode_manager_request_camera_recovery(void)
 
 void mode_manager_run(void)
 {
+    const uint32_t all_events = EVENT_MODE_REQUEST | EVENT_CAPTURE_TRIGGER |
+                                EVENT_RESEND_REQUEST | EVENT_FRAME_ACK |
+                                EVENT_CAMERA_RECOVERY_REQUEST;
     while (true) {
-        uint32_t events = k_event_wait(&mode_events,
-                                       EVENT_MODE_REQUEST | EVENT_CAPTURE_TRIGGER |
-                                           EVENT_RESEND_REQUEST | EVENT_FRAME_ACK |
-                                           EVENT_CAMERA_RECOVERY_REQUEST,
-                                       true, K_FOREVER);
+        uint32_t events = k_event_wait(&mode_events, all_events,
+                                       false, K_FOREVER);
+        k_event_clear(&mode_events, events);
 
         /* Mode changes take priority, preventing a stale gesture from starting
          * capture after the app has requested the streaming profile. */
         if ((events & EVENT_MODE_REQUEST) != 0U) {
             transition_to(requested_mode);
+        }
+        /* An ACK refers to the retained frame, which the next capture
+         * invalidates, so settle it before any new capture starts. */
+        if ((events & EVENT_FRAME_ACK) != 0U) {
+            handle_frame_ack();
         }
         if ((events & EVENT_CAMERA_RECOVERY_REQUEST) != 0U) {
             handle_camera_recovery_request();
@@ -584,9 +611,6 @@ void mode_manager_run(void)
         }
         if ((events & EVENT_RESEND_REQUEST) != 0U) {
             handle_resend_request();
-        }
-        if ((events & EVENT_FRAME_ACK) != 0U) {
-            handle_frame_ack();
         }
     }
 }

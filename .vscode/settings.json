@@ -6,5 +6,18 @@
     // directory CONTAINING boards/, not the boards/ directory itself.
     "nrf-connect.boardRoots": [
         "${workspaceFolder}"
-    ]
+    ],
+    "cmake.sourceDirectory": "/Users/yuxindu/Documents/Projects/fing_lab/firmware",
+    // Code navigation: use clangd with the compile database from the nRF Connect
+    // build (sysbuild puts the app's database under <build dir>/firmware/).
+    // Point this at whichever build configuration you actually compile.
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/firmware/fing_18mm/firmware",
+        "--query-driver=/opt/nordic/ncs/toolchains/**/arm-zephyr-eabi-gcc",
+        "--header-insertion=never",
+        "--background-index"
+    ],
+    // Avoid two C language servers fighting over go-to-definition.
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "cmake.configureOnOpen": false
 }

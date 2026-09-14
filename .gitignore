@@ -1,0 +1,8 @@
+build*/
+fing_18mm/
+fing_20mm/
+docs/
+.DS_Store
+boards/.DS_Store
+app/fing_lab/.DS_Store
+app/.DS_Store

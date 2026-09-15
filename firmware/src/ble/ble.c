@@ -30,6 +30,7 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define MAX_PAYLOAD_CHUNK 244U
 #define ADV_RESTART_RETRY_DELAY_MS 50
 #define ADV_RESTART_MAX_ATTEMPTS 20
+#define ADV_RESTART_SLOW_RETRY_MS 1000
 #define ADV_FAST_DURATION_SECONDS 30
 #define STATUS_NOTIFY_RETRY_DELAY_MS 20
 #define STATUS_NOTIFY_MAX_ATTEMPTS 50
@@ -367,12 +368,20 @@ static void restart_advertising_work_handler(struct k_work *work)
         return;
     }
 
-    advertising_restart_attempts++;
-    LOG_WRN("Advertising restart failed: %d (attempt %u/%u)",
-            err, advertising_restart_attempts, ADV_RESTART_MAX_ATTEMPTS);
+    /* Just after a disconnect this can fail with -ENOMEM until the stack frees
+     * the connection object, so retry quickly at first. Never give up: a ring
+     * that stops advertising is unreachable until it is power-cycled. */
     if (advertising_restart_attempts < ADV_RESTART_MAX_ATTEMPTS) {
+        advertising_restart_attempts++;
+        LOG_WRN("Advertising restart failed: %d (attempt %u/%u)",
+                err, advertising_restart_attempts, ADV_RESTART_MAX_ATTEMPTS);
         (void)k_work_reschedule(&restart_advertising_work,
                                 K_MSEC(ADV_RESTART_RETRY_DELAY_MS));
+    } else {
+        LOG_WRN("Advertising restart still failing: %d; retrying in %u ms",
+                err, ADV_RESTART_SLOW_RETRY_MS);
+        (void)k_work_reschedule(&restart_advertising_work,
+                                K_MSEC(ADV_RESTART_SLOW_RETRY_MS));
     }
 }
 
@@ -450,8 +459,11 @@ int ble_init(ble_mode_request_callback_t callback,
         schedule_slow_advertising();
         LOG_INF("Advertising as %s (%s)", CONFIG_BT_DEVICE_NAME,
                 device_info_value);
+    } else {
+        LOG_ERR("Initial advertising start failed: %d; retrying", err);
+        schedule_advertising_restart();
     }
-    return err;
+    return 0;
 }
 
 void ble_set_active_mode(enum fing_mode mode)

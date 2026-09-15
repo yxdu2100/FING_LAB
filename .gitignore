@@ -1,6 +1,6 @@
 build*/
-fing_18mm/
-fing_20mm/
+firmware/fing_18mm/
+firmware/fing_20mm/
 docs/
 .DS_Store
 boards/.DS_Store

@@ -11,10 +11,27 @@ enum CaptureImageRotation: Int, CaseIterable, Identifiable, Codable {
     var swapsDimensions: Bool { self == .degrees90 || self == .degrees270 }
 }
 
+enum CaptureRenderPipeline: String, CaseIterable, Identifiable, Codable {
+    case original
+    case classical
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .original: return "Original"
+        case .classical: return "Enhanced (non-AI)"
+        }
+    }
+}
+
 enum CaptureRenderSettings {
     static let rotationDefaultsKey = "FingLab.captureImageRotationDegrees"
+    static let pipelineDefaultsKey = "FingLab.captureRenderPipeline"
     static let profileVersion = 2
+    static let classicalProfileVersion = 1
     static let gamma = 0.92
+    static let classicalGamma = 0.82
 
     static var currentRotation: CaptureImageRotation {
         let defaults = UserDefaults.standard
@@ -27,5 +44,27 @@ enum CaptureRenderSettings {
             rawValue: defaults.integer(forKey: rotationDefaultsKey)
         ) ?? .degrees180
     }
-}
 
+    static var currentPipeline: CaptureRenderPipeline {
+        guard let rawValue = UserDefaults.standard.string(forKey: pipelineDefaultsKey) else {
+            // Preserve the existing reconstruction unless the participant or
+            // researcher explicitly enables the enhanced pipeline.
+            return .original
+        }
+        return CaptureRenderPipeline(rawValue: rawValue) ?? .original
+    }
+
+    static func profileVersion(for pipeline: CaptureRenderPipeline) -> Int {
+        switch pipeline {
+        case .original: return profileVersion
+        case .classical: return classicalProfileVersion
+        }
+    }
+
+    static func gamma(for pipeline: CaptureRenderPipeline) -> Double {
+        switch pipeline {
+        case .original: return gamma
+        case .classical: return classicalGamma
+        }
+    }
+}

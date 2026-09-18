@@ -33,6 +33,7 @@ private struct CaptureMetadata: Codable {
     let imageFile: String
     let deviceIdentity: RingDeviceIdentity?
     var rotationDegrees: Int?
+    var renderPipeline: String?
     var renderGamma: Double?
     var renderProfileVersion: Int?
 }
@@ -94,8 +95,13 @@ final class CaptureStore {
             imageFile: imageURL.lastPathComponent,
             deviceIdentity: deviceIdentity,
             rotationDegrees: CaptureRenderSettings.currentRotation.rawValue,
-            renderGamma: CaptureRenderSettings.gamma,
-            renderProfileVersion: CaptureRenderSettings.profileVersion
+            renderPipeline: CaptureRenderSettings.currentPipeline.rawValue,
+            renderGamma: CaptureRenderSettings.gamma(
+                for: CaptureRenderSettings.currentPipeline
+            ),
+            renderProfileVersion: CaptureRenderSettings.profileVersion(
+                for: CaptureRenderSettings.currentPipeline
+            )
         )
 
         try png.write(to: imageURL, options: .atomic)
@@ -172,6 +178,7 @@ final class CaptureStore {
                     imageFile: metadata.imageFile,
                     deviceIdentity: metadata.deviceIdentity,
                     rotationDegrees: metadata.rotationDegrees,
+                    renderPipeline: metadata.renderPipeline,
                     renderGamma: metadata.renderGamma,
                     renderProfileVersion: metadata.renderProfileVersion
                 )
@@ -201,6 +208,7 @@ final class CaptureStore {
     /// avoids cumulative rotation or brightness changes and keeps exports
     /// deterministic when the global orientation changes repeatedly.
     func rerenderAll(rotation: CaptureImageRotation,
+                     pipeline: CaptureRenderPipeline = CaptureRenderSettings.currentPipeline,
                      onlyIfNeeded: Bool = false) throws -> [SavedCapture] {
         let metadataURLs = (try? fileManager.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil
@@ -209,22 +217,34 @@ final class CaptureStore {
         for metadataURL in metadataURLs {
             let metadataData = try Data(contentsOf: metadataURL)
             var metadata = try decoder.decode(CaptureMetadata.self, from: metadataData)
+            // Captures written before pipeline selection existed used the
+            // original renderer, so a missing value migrates to `.original`.
+            let savedPipeline = metadata.renderPipeline.flatMap(CaptureRenderPipeline.init)
+                ?? .original
             let alreadyCurrent = metadata.rotationDegrees == rotation.rawValue &&
-                metadata.renderGamma == CaptureRenderSettings.gamma &&
-                metadata.renderProfileVersion == CaptureRenderSettings.profileVersion
+                savedPipeline == pipeline &&
+                metadata.renderGamma == CaptureRenderSettings.gamma(for: pipeline) &&
+                metadata.renderProfileVersion == CaptureRenderSettings.profileVersion(
+                    for: pipeline
+                )
             if onlyIfNeeded && alreadyCurrent { continue }
 
             let rawURL = root.appendingPathComponent(metadata.rawFile)
             let imageURL = root.appendingPathComponent(metadata.imageFile)
             let raw = try Data(contentsOf: rawURL)
-            guard let image = BayerFrameRenderer.makeImage(from: raw, rotation: rotation),
+            guard let image = CaptureFrameRenderer.makeImage(
+                from: raw,
+                rotation: rotation,
+                pipeline: pipeline
+            ),
                   let png = image.pngData() else {
                 throw StoreError.imageEncodingFailed
             }
 
             metadata.rotationDegrees = rotation.rawValue
-            metadata.renderGamma = CaptureRenderSettings.gamma
-            metadata.renderProfileVersion = CaptureRenderSettings.profileVersion
+            metadata.renderPipeline = pipeline.rawValue
+            metadata.renderGamma = CaptureRenderSettings.gamma(for: pipeline)
+            metadata.renderProfileVersion = CaptureRenderSettings.profileVersion(for: pipeline)
             metadata.outputWidth = Int(image.size.width.rounded())
             metadata.outputHeight = Int(image.size.height.rounded())
 

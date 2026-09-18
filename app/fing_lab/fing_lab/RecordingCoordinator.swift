@@ -36,6 +36,14 @@ final class AppSettings {
             )
         }
     }
+    var captureRenderPipeline: CaptureRenderPipeline {
+        didSet {
+            UserDefaults.standard.set(
+                captureRenderPipeline.rawValue,
+                forKey: CaptureRenderSettings.pipelineDefaultsKey
+            )
+        }
+    }
     var captureTransferStartAudio: Bool {
         didSet {
             UserDefaults.standard.set(
@@ -90,6 +98,7 @@ final class AppSettings {
         // Migrate installations of RingCollector that stored the old label.
         enabledGestureIDs = savedGestureIDs.map { $0 == "pinch_hold" ? "hover" : $0 }
         captureImageRotation = CaptureRenderSettings.currentRotation
+        captureRenderPipeline = CaptureRenderSettings.currentPipeline
         captureTransferStartAudio = CaptureFeedbackPreferences.isTransferStartAudioEnabled
     }
 }
@@ -146,6 +155,7 @@ final class RecordingCoordinator {
         do {
             captures = try captureStore.rerenderAll(
                 rotation: CaptureRenderSettings.currentRotation,
+                pipeline: CaptureRenderSettings.currentPipeline,
                 onlyIfNeeded: true
             )
         } catch {
@@ -169,7 +179,7 @@ final class RecordingCoordinator {
                 self.ble.acknowledgeFrame(frame.header.frameID)
                 return
             }
-            guard let image = BayerFrameRenderer.makeImage(from: frame.rawBayer) else {
+            guard let image = CaptureFrameRenderer.makeImage(from: frame.rawBayer) else {
                 self.captureError = "Could not reconstruct the 324 × 244 Bayer frame."
                 return
             }
@@ -267,13 +277,37 @@ final class RecordingCoordinator {
         defer { isReprocessingCaptures = false }
 
         do {
-            captures = try captureStore.rerenderAll(rotation: rotation)
+            captures = try captureStore.rerenderAll(
+                rotation: rotation,
+                pipeline: CaptureRenderSettings.currentPipeline
+            )
             latestImage = captures.first?.image
             latestCaptureIndex = captures.first?.captureIndex
             captureExportArchive = nil
             return true
         } catch {
             captureError = "Could not rotate all captures: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    func applyCaptureRenderPipeline(_ pipeline: CaptureRenderPipeline) -> Bool {
+        guard !isReprocessingCaptures else { return false }
+        isReprocessingCaptures = true
+        defer { isReprocessingCaptures = false }
+
+        do {
+            captures = try captureStore.rerenderAll(
+                rotation: CaptureRenderSettings.currentRotation,
+                pipeline: pipeline
+            )
+            latestImage = captures.first?.image
+            latestCaptureIndex = captures.first?.captureIndex
+            captureExportArchive = nil
+            return true
+        } catch {
+            captureError = "Could not update image processing: \(error.localizedDescription)"
             return false
         }
     }

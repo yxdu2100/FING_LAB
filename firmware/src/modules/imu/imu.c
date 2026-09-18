@@ -34,6 +34,10 @@ LOG_MODULE_REGISTER(imu_module, LOG_LEVEL_INF);
 #define MLC_STATUS_MLC1 BIT(0)
 #define MLC_POLL_INTERVAL_MS 1U
 #define MLC_POLL_TIMEOUT_MS 100U
+/* INT1 is a level signal, so a missed or uncleared interrupt leaves it high
+ * and no new edge is ever produced. Re-check the MLC status this often so
+ * the detector cannot wedge permanently. */
+#define MLC_POLL_FALLBACK_MS 200U
 
 #define REG_CTRL1_XL 0x10U
 #define REG_CTRL2_G 0x11U
@@ -48,7 +52,7 @@ LOG_MODULE_REGISTER(imu_module, LOG_LEVEL_INF);
 static const struct device *const i2c_bus = DEVICE_DT_GET(IMU_I2C_NODE);
 static const struct device *const gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 static struct gpio_callback int_callback;
-static struct k_work int_work;
+static struct k_work_delayable int_work;
 static struct k_work_delayable hover_work;
 static imu_gesture_callback_t gesture_callback;
 static volatile bool mlc_enabled;
@@ -275,33 +279,31 @@ static void interrupt_work_handler(struct k_work *work)
     int err = reg_read(REG_ALL_INT_SRC, &all_interrupts);
     if (err != 0) {
         LOG_ERR("Cannot read ALL_INT_SRC: %d", err);
-        return;
+        goto reschedule;
     }
 
     err = reg_read(REG_MLC_STATUS_MAINPAGE, &mlc_status);
     if (err != 0) {
         LOG_ERR("Cannot read MLC_STATUS_MAINPAGE: %d", err);
-        return;
+        goto reschedule;
     }
-
-    /* Keep this at INFO while bringing up the gesture path. It proves that
-     * the GPIO interrupt reached the MCU and shows which IMU source asserted. */
-    LOG_INF("INT1 received: ALL_INT_SRC=0x%02x MLC_STATUS=0x%02x",
-            all_interrupts, mlc_status);
 
     /* 0x00 is a valid class, so never interpret MLC1_SRC unless an MLC1
-     * interrupt is pending. This avoids treating an idle zero as a flick. */
+     * interrupt is pending. This avoids treating an idle zero as a flick.
+     * This handler also runs as a periodic poll, so a quiet pass is normal
+     * and is deliberately not logged. */
     if ((all_interrupts & ALL_INT_SRC_EMB_FUNC_IA) == 0U ||
         (mlc_status & MLC_STATUS_MLC1) == 0U) {
-        LOG_INF("Ignoring non-MLC1 interrupt (all=0x%02x mlc=0x%02x)",
-                all_interrupts, mlc_status);
-        return;
+        goto reschedule;
     }
+
+    LOG_INF("MLC1 pending: ALL_INT_SRC=0x%02x MLC_STATUS=0x%02x",
+            all_interrupts, mlc_status);
 
     err = read_mlc1_result(&mlc_result);
     if (err != 0) {
         LOG_ERR("Cannot read MLC1_SRC (0x70): %d", err);
-        return;
+        goto reschedule;
     }
 
     if (mlc_enabled && mlc_result == CAPTURE_MLC_TARGET_CLASS) {
@@ -311,6 +313,15 @@ static void interrupt_work_handler(struct k_work *work)
         }
     } else {
         LOG_INF("MLC class 0x%02x ignored", mlc_result);
+    }
+
+reschedule:
+    /* Wait for the next edge, but re-check on a timeout as well. A status read
+     * that failed, or an interrupt the sensor never cleared, would otherwise
+     * hold INT1 high forever and stop every later gesture. imu_stream.c
+     * applies the same fallback to its watermark interrupt. */
+    if (mlc_enabled) {
+        (void)k_work_reschedule(&int_work, K_MSEC(MLC_POLL_FALLBACK_MS));
     }
 }
 
@@ -324,7 +335,7 @@ static void interrupt_handler(const struct device *device,
 
     /* Keep I2C and all capture work outside interrupt context. */
     if (mlc_enabled) {
-        (void)k_work_submit(&int_work);
+        (void)k_work_reschedule(&int_work, K_NO_WAIT);
     }
 }
 
@@ -337,7 +348,7 @@ int imu_init(imu_gesture_callback_t callback)
     }
 
     gesture_callback = callback;
-    k_work_init(&int_work, interrupt_work_handler);
+    k_work_init_delayable(&int_work, interrupt_work_handler);
     k_work_init_delayable(&hover_work, hover_work_handler);
 
     err = gpio_pin_configure(gpio1, IMU_INT_PIN, GPIO_INPUT);
@@ -381,6 +392,9 @@ int imu_start_mlc(void)
         return err;
     }
 
+    /* Arm the periodic fallback poll alongside the edge interrupt. */
+    (void)k_work_reschedule(&int_work, K_MSEC(MLC_POLL_FALLBACK_MS));
+
     LOG_INF("MLC ready: INT1 / MLC1_SRC 0x70 / target class 0x%02x",
             CAPTURE_MLC_TARGET_CLASS);
     return 0;
@@ -392,7 +406,7 @@ void imu_stop_mlc(void)
 
     mlc_enabled = false;
     (void)gpio_pin_interrupt_configure(gpio1, IMU_INT_PIN, GPIO_INT_DISABLE);
-    (void)k_work_cancel_sync(&int_work, &sync);
+    (void)k_work_cancel_delayable_sync(&int_work, &sync);
 
     /* Clear both embedded-function routing layers, then power the IMU down.
      * The streaming profile will perform a complete register rewrite later. */

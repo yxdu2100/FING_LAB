@@ -62,10 +62,14 @@ struct SettingsView: View {
                             Text(rotation.label).tag(rotation)
                         }
                     }
+                    Toggle("Enhanced non-AI processing", isOn: classicalPipelineBinding)
                     if coordinator.isReprocessingCaptures {
                         ProgressView("Updating saved PNG files…")
                     }
-                    Text("The selected rotation is applied to the current preview, every saved PNG, and all future captures. Raw Bayer files are never modified.")
+                    Text("Enhanced processing adds black-level correction, edge-aware demosaicing, denoising, local contrast, lens-shading correction, and mild sharpening. It uses no neural network or generative processing.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Image processing and rotation are applied to the current preview, every saved PNG, and all future captures. Raw Bayer files are never modified, so you can switch back to the original reconstruction at any time.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("The sound plays after the fourth camera frame is ready, when BLE image transfer begins.")
@@ -106,6 +110,19 @@ struct SettingsView: View {
                 guard rotation != settings.captureImageRotation else { return }
                 if coordinator.applyCaptureRotation(rotation) {
                     settings.captureImageRotation = rotation
+                }
+            }
+        )
+    }
+
+    private var classicalPipelineBinding: Binding<Bool> {
+        Binding(
+            get: { settings.captureRenderPipeline == .classical },
+            set: { enabled in
+                let pipeline: CaptureRenderPipeline = enabled ? .classical : .original
+                guard pipeline != settings.captureRenderPipeline else { return }
+                if coordinator.applyCaptureRenderPipeline(pipeline) {
+                    settings.captureRenderPipeline = pipeline
                 }
             }
         )

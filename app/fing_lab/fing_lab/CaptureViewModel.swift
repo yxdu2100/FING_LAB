@@ -61,7 +61,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     private func receive(_ frame: ReassembledFrame) {
-        guard let image = BayerFrameRenderer.makeImage(from: frame.rawBayer) else {
+        guard let image = CaptureFrameRenderer.makeImage(from: frame.rawBayer) else {
             errorMessage = "Frame \(frame.header.frameID) could not be reconstructed."
             return
         }

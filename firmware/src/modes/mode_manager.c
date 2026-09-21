@@ -386,7 +386,7 @@ static void handle_capture_trigger(void)
     ble_publish_capture_status(CAPTURE_STATUS_TRANSFER_STARTED,
                                attempt_id, distance_mm, 0, 0, 0);
     err = ble_send_frame(frame, FRAME_BYTES, last_frame_id,
-                         last_frame_timestamp_ms);
+                         last_frame_timestamp_ms, last_frame_distance_mm);
     if (err == -ECANCELED) {
         last_transfer_failed = true;
         LOG_INF("BLE image transfer cancelled by mode request");
@@ -428,7 +428,8 @@ static void handle_resend_request(void)
                                last_frame_distance_mm,
                                0, 0, 0);
     int err = ble_send_frame(camera_get_frame_buffer(), FRAME_BYTES,
-                             last_frame_id, last_frame_timestamp_ms);
+                             last_frame_id, last_frame_timestamp_ms,
+                             last_frame_distance_mm);
     if (err != 0) {
         last_transfer_failed = true;
         ble_publish_capture_status(CAPTURE_STATUS_TRANSFER_FAILED,

@@ -43,6 +43,11 @@ LOG_MODULE_REGISTER(ble_module, LOG_LEVEL_INF);
 #define CONTROL_RESTART_MCU_RESERVED 7U
 #define CAPTURE_STATUS_PACKET_LENGTH 16U
 #define CAPTURE_STATUS_VERSION 1U
+/* Image header v2 keeps the legacy 16-byte prefix and appends:
+ * version (u8), header length (u8), and ToF distance in millimetres (u16 LE).
+ * At 20 bytes it still fits the notification payload at the default ATT MTU. */
+#define IMAGE_HEADER_LENGTH 20U
+#define IMAGE_HEADER_VERSION 2U
 
 #define BT_UUID_FING_SERVICE_VAL \
     BT_UUID_128_ENCODE(0x12345678, 0x9abc, 0x11ee, 0xbe56, 0x0242ac120002)
@@ -584,9 +589,10 @@ static int notify_image_with_retry(const uint8_t *data, uint16_t length)
 }
 
 int ble_send_frame(const uint8_t *frame, size_t length,
-                   uint32_t frame_id, uint32_t timestamp_ms)
+                   uint32_t frame_id, uint32_t timestamp_ms,
+                   uint16_t distance_mm)
 {
-    uint8_t header[16];
+    uint8_t header[IMAGE_HEADER_LENGTH];
     if (frame == NULL || length == 0U || length > UINT32_MAX) {
         return -EINVAL;
     }
@@ -594,13 +600,16 @@ int ble_send_frame(const uint8_t *frame, size_t length,
         return -ENOTCONN;
     }
 
-    LOG_INF("Frame %u BLE source timestamp=%u CRC32=0x%08x",
-            frame_id, timestamp_ms, crc32_ieee(frame, length));
+    LOG_INF("Frame %u BLE source timestamp=%u distance=%u mm CRC32=0x%08x",
+            frame_id, timestamp_ms, distance_mm, crc32_ieee(frame, length));
 
     sys_put_le32(0x12345678U, &header[0]);
     sys_put_le32(frame_id, &header[4]);
     sys_put_le32(timestamp_ms, &header[8]);
     sys_put_le32((uint32_t)length, &header[12]);
+    header[16] = IMAGE_HEADER_VERSION;
+    header[17] = IMAGE_HEADER_LENGTH;
+    sys_put_le16(distance_mm, &header[18]);
     int err = notify_image_with_retry(header, sizeof(header));
     if (err != 0) {
         return err;

@@ -80,7 +80,8 @@ bool ble_can_send_frame(void);
 bool ble_is_camera_recovery_requested(void);
 void ble_camera_recovery_request_handled(void);
 int ble_send_frame(const uint8_t *frame, size_t length,
-                   uint32_t frame_id, uint32_t timestamp_ms);
+                   uint32_t frame_id, uint32_t timestamp_ms,
+                   uint16_t distance_mm);
 void ble_send_imu_samples(const struct bt_app_imu_sample *samples,
                           size_t sample_count);
 

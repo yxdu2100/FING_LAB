@@ -8,6 +8,7 @@ struct SavedCapture: Identifiable {
     let captureIndex: UInt64
     let frameID: UInt32
     let deviceTimestampMs: UInt32
+    let distanceMm: UInt16?
     let receivedAt: Date
     let imageURL: URL
     let rawURL: URL
@@ -23,6 +24,8 @@ private struct CaptureMetadata: Codable {
     let captureIndex: UInt64?
     let frameID: UInt32
     let deviceTimestampMs: UInt32
+    /// Optional so captures saved before image-header v2 still load.
+    let distanceMm: UInt16?
     let receivedAt: Date
     let rawWidth: Int
     let rawHeight: Int
@@ -85,6 +88,7 @@ final class CaptureStore {
             captureIndex: captureIndex,
             frameID: frame.header.frameID,
             deviceTimestampMs: frame.header.timestampMs,
+            distanceMm: frame.header.distanceMm,
             receivedAt: receivedAt,
             rawWidth: configuration.rawWidth,
             rawHeight: configuration.rawHeight,
@@ -121,11 +125,19 @@ final class CaptureStore {
             forKey: Self.nextCaptureIndexKey
         )
 
-        return SavedCapture(id: id, captureIndex: captureIndex, frameID: metadata.frameID,
-                            deviceTimestampMs: metadata.deviceTimestampMs,
-                            receivedAt: receivedAt, imageURL: imageURL,
-                            rawURL: rawURL, metadataURL: metadataURL, image: image,
-                            deviceIdentity: deviceIdentity)
+        return SavedCapture(
+            id: id,
+            captureIndex: captureIndex,
+            frameID: metadata.frameID,
+            deviceTimestampMs: metadata.deviceTimestampMs,
+            distanceMm: metadata.distanceMm,
+            receivedAt: receivedAt,
+            imageURL: imageURL,
+            rawURL: rawURL,
+            metadataURL: metadataURL,
+            image: image,
+            deviceIdentity: deviceIdentity
+        )
     }
 
     func load() -> [SavedCapture] {
@@ -168,6 +180,7 @@ final class CaptureStore {
                     captureIndex: captureIndex,
                     frameID: metadata.frameID,
                     deviceTimestampMs: metadata.deviceTimestampMs,
+                    distanceMm: metadata.distanceMm,
                     receivedAt: metadata.receivedAt,
                     rawWidth: metadata.rawWidth,
                     rawHeight: metadata.rawHeight,
@@ -192,6 +205,7 @@ final class CaptureStore {
                 captureIndex: captureIndex,
                 frameID: metadata.frameID,
                 deviceTimestampMs: metadata.deviceTimestampMs,
+                distanceMm: metadata.distanceMm,
                 receivedAt: metadata.receivedAt,
                 imageURL: imageURL,
                 rawURL: rawURL,

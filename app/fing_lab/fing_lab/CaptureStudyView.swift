@@ -157,6 +157,11 @@ struct CaptureStudyView: View {
             HStack {
                 Text("Latest 320 × 240 Preview").font(.headline)
                 Spacer()
+                if let distanceMm = coordinator.latestDistanceMm {
+                    Label("\(distanceMm) mm", systemImage: "ruler")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 if let captureIndex = coordinator.latestCaptureIndex {
                     Text("Frame \(captureIndex)").font(.caption.monospacedDigit())
                 }
@@ -174,7 +179,8 @@ struct CaptureStudyView: View {
                                 id: "latest-\(coordinator.latestCaptureIndex ?? 0)",
                                 image: image,
                                 title: coordinator.latestCaptureIndex.map { "Frame \($0)" }
-                                    ?? "Latest Capture"
+                                    ?? "Latest Capture",
+                                distanceMm: coordinator.latestDistanceMm
                             )
                         }
                     VStack {
@@ -324,7 +330,8 @@ struct CaptureStudyView: View {
                             inspectedImage = CaptureImageViewerItem(
                                 id: capture.id,
                                 image: capture.image,
-                                title: "Frame \(capture.captureIndex)"
+                                title: "Frame \(capture.captureIndex)",
+                                distanceMm: capture.distanceMm
                             )
                         }
                     VStack(alignment: .leading, spacing: 5) {
@@ -335,6 +342,11 @@ struct CaptureStudyView: View {
                         Text(capture.receivedAt, style: .time)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if let distanceMm = capture.distanceMm {
+                            Label("\(distanceMm) mm", systemImage: "ruler")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
                         Text("PNG + 324×244 Bayer + JSON")
                             .font(.caption2)
                             .foregroundStyle(.secondary)

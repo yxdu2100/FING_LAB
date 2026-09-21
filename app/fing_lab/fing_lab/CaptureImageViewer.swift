@@ -5,6 +5,7 @@ struct CaptureImageViewerItem: Identifiable {
     let id: String
     let image: UIImage
     let title: String
+    let distanceMm: UInt16?
 }
 
 /// Full-resolution capture inspection with pinch, pan, and double-tap zoom.
@@ -44,6 +45,19 @@ struct CaptureImageViewer: View {
                         }
                         .simultaneousGesture(magnificationGesture)
                         .simultaneousGesture(dragGesture)
+                    if let distanceMm = item.distanceMm {
+                        VStack {
+                            Spacer()
+                            Label("Distance \(distanceMm) mm", systemImage: "ruler")
+                                .font(.headline.monospacedDigit())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .padding(.bottom, 18)
+                        }
+                        .allowsHitTesting(false)
+                    }
                 }
             }
             .navigationTitle(item.title)

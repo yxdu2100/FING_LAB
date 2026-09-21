@@ -118,6 +118,7 @@ final class RecordingCoordinator {
     var isActiveSession = false
     var latestImage: UIImage?
     var latestCaptureIndex: UInt64?
+    var latestDistanceMm: UInt16?
     var captures: [SavedCapture] = []
     var captureError: String?
     var captureExportArchive: URL?
@@ -164,6 +165,7 @@ final class RecordingCoordinator {
         }
         latestImage = captures.first?.image
         latestCaptureIndex = captures.first?.captureIndex
+        latestDistanceMm = captures.first?.distanceMm
         ble.onFrameReceived = { [weak self] frame in
             guard let self else { return }
             if let existing = self.captures.first(where: {
@@ -176,6 +178,7 @@ final class RecordingCoordinator {
                 // unique and must never be used to match persisted captures.
                 self.latestImage = existing.image
                 self.latestCaptureIndex = existing.captureIndex
+                self.latestDistanceMm = existing.distanceMm
                 self.ble.acknowledgeFrame(frame.header.frameID)
                 return
             }
@@ -192,6 +195,7 @@ final class RecordingCoordinator {
                 self.captures.insert(saved, at: 0)
                 self.latestImage = image
                 self.latestCaptureIndex = saved.captureIndex
+                self.latestDistanceMm = saved.distanceMm
                 self.captureExportArchive = nil
                 self.ble.acknowledgeFrame(frame.header.frameID)
             } catch {
@@ -244,6 +248,7 @@ final class RecordingCoordinator {
             captures.removeAll { $0.id == capture.id }
             latestImage = captures.first?.image
             latestCaptureIndex = captures.first?.captureIndex
+            latestDistanceMm = captures.first?.distanceMm
             captureExportArchive = nil
         } catch {
             captureError = error.localizedDescription
@@ -256,6 +261,7 @@ final class RecordingCoordinator {
             captures = []
             latestImage = nil
             latestCaptureIndex = nil
+            latestDistanceMm = nil
             captureExportArchive = nil
         } catch {
             captureError = error.localizedDescription
@@ -283,6 +289,7 @@ final class RecordingCoordinator {
             )
             latestImage = captures.first?.image
             latestCaptureIndex = captures.first?.captureIndex
+            latestDistanceMm = captures.first?.distanceMm
             captureExportArchive = nil
             return true
         } catch {
@@ -304,6 +311,7 @@ final class RecordingCoordinator {
             )
             latestImage = captures.first?.image
             latestCaptureIndex = captures.first?.captureIndex
+            latestDistanceMm = captures.first?.distanceMm
             captureExportArchive = nil
             return true
         } catch {

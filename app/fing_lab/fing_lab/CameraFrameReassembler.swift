@@ -22,7 +22,8 @@ final class CameraFrameReassembler {
         switch state {
         case .header:
             guard
-                packet.count == configuration.headerLength,
+                packet.count == configuration.legacyHeaderLength ||
+                    packet.count == configuration.headerLength,
                 let header = CameraFrameHeader(data: packet),
                 header.marker == configuration.marker,
                 Int(header.payloadLength) == configuration.payloadLength

@@ -69,10 +69,23 @@
  * then select the MLC source above and set its target class here. */
 #define CAPTURE_MLC_TARGET_CLASS 0x00U
 
-/* Threshold hover path. The supplied decision tree classifies a window as
- * hover when max(accel Y) <= 0.188720 g and min(accel Y) > -0.444580 g.
- * Capture mode uses +/-8 g (4096 LSB/g), producing the rounded raw limits
- * below. Fifty samples at 120 Hz reproduce a roughly 417 ms feature window.
+/* Threshold hover path. A 50-sample window (about 417 ms at 120 Hz) counts as
+ * hover only when every sample satisfies all of the following:
+ *   Y BAND  max(Y) <= 0.188720 g and min(Y) > -0.444580 g, from the original
+ *           MEMS Studio decision tree (converted at 4096 LSB/g)
+ *   FLAT    Z inside [-1.30 g, -0.70 g]: PCB face-down, gravity on -Z
+ *   LEVEL   sqrt(X^2 + Y^2) <= 0.60 g, about 37 degrees of tilt
+ *   STILL   max(Z) - min(Z) <= 0.12 g: the ring is held, not moving
+ * Capture mode runs the accelerometer at +/-8 g. The FLAT, LEVEL and STILL
+ * limits use the datasheet sensitivity of 0.244 mg/LSB, the same factor the
+ * recording app used when it wrote mems_hover_dataset.
+ *
+ * Tuned on mems_hover_dataset (144 hover windows from 3 sessions, 288 null
+ * windows), testing every 50-sample window: the Y band alone detected 140/144
+ * hover windows and fired on 56/288 null windows; the combined rule detects
+ * 137/144 and fires on 39/288. Detection was unchanged for tilt 600-700 mg,
+ * stillness 120-140 mg and Z max -750..-650 mg, so no limit sits on an edge.
+ *
  * A complete non-hover window is required before the first trigger, and
  * after every trigger, so a stationary ring cannot repeatedly take photos. */
 #define CAPTURE_HOVER_SAMPLE_RATE_HZ       120U
@@ -81,6 +94,10 @@
 #define CAPTURE_HOVER_WINDOW_SAMPLES       50U
 #define CAPTURE_HOVER_MAX_Y_RAW            773
 #define CAPTURE_HOVER_MIN_Y_RAW            (-1821)
+#define CAPTURE_HOVER_Z_MIN_RAW            (-5328)  /* -1.30 g */
+#define CAPTURE_HOVER_Z_MAX_RAW            (-2869)  /* -0.70 g */
+#define CAPTURE_HOVER_LATERAL_MAX_RAW      2459     /*  0.60 g */
+#define CAPTURE_HOVER_Z_STILL_RANGE_RAW    492      /*  0.12 g peak-to-peak */
 #define CAPTURE_HOVER_REARM_COOLDOWN_MS    750U
 
 #if CAPTURE_GESTURE_SOURCE != CAPTURE_GESTURE_SOURCE_MLC && \

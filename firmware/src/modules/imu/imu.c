@@ -43,7 +43,8 @@ LOG_MODULE_REGISTER(imu_module, LOG_LEVEL_INF);
 #define REG_CTRL2_G 0x11U
 #define REG_CTRL3_C 0x12U
 #define REG_CTRL8_XL 0x17U
-#define REG_OUTY_L_A 0x2AU
+/* OUTX_L_A..OUTZ_H_A: X, Y and Z as 6 consecutive little-endian bytes. */
+#define REG_OUTX_L_A 0x28U
 #define CTRL3_BDU_IF_INC (BIT(6) | BIT(2))
 #define CTRL8_XL_FS_MASK 0x03U
 #define CTRL8_XL_FS_8G 0x02U
@@ -57,7 +58,9 @@ static struct k_work_delayable hover_work;
 static imu_gesture_callback_t gesture_callback;
 static volatile bool mlc_enabled;
 static volatile bool hover_enabled;
+static int16_t hover_x_window[CAPTURE_HOVER_WINDOW_SAMPLES];
 static int16_t hover_y_window[CAPTURE_HOVER_WINDOW_SAMPLES];
+static int16_t hover_z_window[CAPTURE_HOVER_WINDOW_SAMPLES];
 static uint16_t hover_window_count;
 static uint16_t hover_window_index;
 static bool hover_armed;
@@ -100,24 +103,53 @@ static void hover_reset_window(void)
     hover_armed = false;
 }
 
-static bool hover_window_matches(int16_t *minimum_y, int16_t *maximum_y)
+struct hover_window_stats {
+    int16_t min_y;
+    int16_t max_y;
+    int16_t min_z;
+    int16_t max_z;
+    uint32_t lateral_max_sq;
+};
+
+static bool hover_window_matches(struct hover_window_stats *stats)
 {
-    int16_t minimum = INT16_MAX;
-    int16_t maximum = INT16_MIN;
+    struct hover_window_stats window = {
+        .min_y = INT16_MAX,
+        .max_y = INT16_MIN,
+        .min_z = INT16_MAX,
+        .max_z = INT16_MIN,
+        .lateral_max_sq = 0U,
+    };
 
     if (hover_window_count < CAPTURE_HOVER_WINDOW_SAMPLES) {
         return false;
     }
 
     for (uint16_t i = 0U; i < CAPTURE_HOVER_WINDOW_SAMPLES; ++i) {
-        minimum = MIN(minimum, hover_y_window[i]);
-        maximum = MAX(maximum, hover_y_window[i]);
-    }
-    *minimum_y = minimum;
-    *maximum_y = maximum;
+        int32_t x = hover_x_window[i];
+        int32_t y = hover_y_window[i];
+        /* Each square is at most 2^30, so the sum fits in 32 unsigned bits. */
+        uint32_t lateral_sq = (uint32_t)(x * x) + (uint32_t)(y * y);
 
-    return maximum <= CAPTURE_HOVER_MAX_Y_RAW &&
-           minimum > CAPTURE_HOVER_MIN_Y_RAW;
+        window.min_y = MIN(window.min_y, hover_y_window[i]);
+        window.max_y = MAX(window.max_y, hover_y_window[i]);
+        window.min_z = MIN(window.min_z, hover_z_window[i]);
+        window.max_z = MAX(window.max_z, hover_z_window[i]);
+        window.lateral_max_sq = MAX(window.lateral_max_sq, lateral_sq);
+    }
+    *stats = window;
+
+    /* Comparing squares avoids a square root: sqrt(X^2 + Y^2) <= limit. */
+    const uint32_t lateral_limit_sq =
+        (uint32_t)CAPTURE_HOVER_LATERAL_MAX_RAW * CAPTURE_HOVER_LATERAL_MAX_RAW;
+
+    return window.max_y <= CAPTURE_HOVER_MAX_Y_RAW &&
+           window.min_y > CAPTURE_HOVER_MIN_Y_RAW &&
+           window.min_z >= CAPTURE_HOVER_Z_MIN_RAW &&
+           window.max_z <= CAPTURE_HOVER_Z_MAX_RAW &&
+           (int32_t)window.max_z - window.min_z <=
+               CAPTURE_HOVER_Z_STILL_RANGE_RAW &&
+           window.lateral_max_sq <= lateral_limit_sq;
 }
 
 static void hover_work_handler(struct k_work *work)
@@ -127,33 +159,38 @@ static void hover_work_handler(struct k_work *work)
         return;
     }
 
-    uint8_t bytes[2];
-    int err = reg_read_buf(REG_OUTY_L_A, bytes, sizeof(bytes));
+    uint8_t bytes[6];
+    int err = reg_read_buf(REG_OUTX_L_A, bytes, sizeof(bytes));
     if (err != 0) {
         hover_read_error_count++;
         if ((hover_read_error_count % CAPTURE_HOVER_SAMPLE_RATE_HZ) == 1U) {
-            LOG_WRN("Hover accel-Y read failed (count=%u err=%d)",
+            LOG_WRN("Hover accel read failed (count=%u err=%d)",
                     hover_read_error_count, err);
         }
         goto reschedule;
     }
 
-    int16_t accel_y = (int16_t)(((uint16_t)bytes[1] << 8) | bytes[0]);
-    hover_y_window[hover_window_index] = accel_y;
+    hover_x_window[hover_window_index] =
+        (int16_t)(((uint16_t)bytes[1] << 8) | bytes[0]);
+    hover_y_window[hover_window_index] =
+        (int16_t)(((uint16_t)bytes[3] << 8) | bytes[2]);
+    hover_z_window[hover_window_index] =
+        (int16_t)(((uint16_t)bytes[5] << 8) | bytes[4]);
     hover_window_index =
         (hover_window_index + 1U) % CAPTURE_HOVER_WINDOW_SAMPLES;
     if (hover_window_count < CAPTURE_HOVER_WINDOW_SAMPLES) {
         hover_window_count++;
     }
 
-    int16_t minimum_y;
-    int16_t maximum_y;
-    bool matches = hover_window_matches(&minimum_y, &maximum_y);
+    struct hover_window_stats stats = {0};
+    bool matches = hover_window_matches(&stats);
     if (hover_window_count == CAPTURE_HOVER_WINDOW_SAMPLES) {
         hover_window_eval_count++;
         if ((hover_window_eval_count % CAPTURE_HOVER_SAMPLE_RATE_HZ) == 1U) {
-            LOG_INF("Hover window: minY=%d maxY=%d raw match=%u armed=%u",
-                    minimum_y, maximum_y, matches, hover_armed);
+            LOG_INF("Hover window raw: Y[%d..%d] Z[%d..%d] lateral^2=%u "
+                    "match=%u armed=%u",
+                    stats.min_y, stats.max_y, stats.min_z, stats.max_z,
+                    stats.lateral_max_sq, matches, hover_armed);
         }
     }
     if (!matches && hover_window_count == CAPTURE_HOVER_WINDOW_SAMPLES) {
@@ -170,8 +207,8 @@ static void hover_work_handler(struct k_work *work)
             /* Pause sampling during ToF/camera/BLE activity. The mode manager
              * rearms the detector after the complete capture attempt. */
             hover_enabled = false;
-            LOG_INF("Threshold hover detected: minY=%d maxY=%d raw",
-                    minimum_y, maximum_y);
+            LOG_INF("Threshold hover detected: Y[%d..%d] Z[%d..%d] raw",
+                    stats.min_y, stats.max_y, stats.min_z, stats.max_z);
             if (gesture_callback != NULL) {
                 gesture_callback();
             }
@@ -474,9 +511,12 @@ static int __maybe_unused imu_start_threshold_hover(void)
                             CAPTURE_HOVER_REARM_COOLDOWN_MS;
     hover_enabled = true;
     (void)k_work_reschedule(&hover_work, K_NO_WAIT);
-    LOG_INF("Threshold hover ready: 120 Hz, %u samples, raw Y (%d, %d]",
+    LOG_INF("Threshold hover ready: 120 Hz, %u samples, raw Y (%d, %d] "
+            "Z [%d, %d] lateral <= %d, Z range <= %d",
             CAPTURE_HOVER_WINDOW_SAMPLES,
-            CAPTURE_HOVER_MIN_Y_RAW, CAPTURE_HOVER_MAX_Y_RAW);
+            CAPTURE_HOVER_MIN_Y_RAW, CAPTURE_HOVER_MAX_Y_RAW,
+            CAPTURE_HOVER_Z_MIN_RAW, CAPTURE_HOVER_Z_MAX_RAW,
+            CAPTURE_HOVER_LATERAL_MAX_RAW, CAPTURE_HOVER_Z_STILL_RANGE_RAW);
     return 0;
 }
 

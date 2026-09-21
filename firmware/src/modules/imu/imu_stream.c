@@ -96,6 +96,7 @@ static struct gpio_callback imu_cb_data;
 static struct k_thread imu_stream_thread;
 static K_THREAD_STACK_DEFINE(imu_stream_stack, IMU_THREAD_STACK_SIZE);
 K_MSGQ_DEFINE(imu_drdy_msgq, sizeof(uint32_t), IMU_DRDY_QUEUE_LEN, 4);
+static K_SEM_DEFINE(imu_stream_parked, 0, 1);
 static struct imu_fifo_pair imu_pair_buffer[IMU_FIFO_MAX_PAIRS];
 
 static volatile bool imu_stream_enabled;
@@ -322,6 +323,9 @@ static void imu_emit_slot(uint8_t slot_index, size_t *pair_count, bool force_int
     imu_fill_pair_from_slot(slot,
                             &imu_pair_buffer[*pair_count],
                             imu_current_batch_flags);
+    /* A discontinuity marker belongs to the first complete sample after the
+     * gap, rather than every sample in the next FIFO drain. */
+    imu_current_batch_flags = 0;
     (*pair_count)++;
 
     memset(slot, 0, sizeof(*slot));
@@ -536,6 +540,7 @@ static void imu_stream_thread_fn(void *arg1, void *arg2, void *arg3)
 
         if (!imu_stream_enabled) {
             memset(imu_fifo_slots, 0, sizeof(imu_fifo_slots));
+            k_sem_give(&imu_stream_parked);
             continue;
         }
 
@@ -559,7 +564,10 @@ static void imu_stream_thread_fn(void *arg1, void *arg2, void *arg3)
                  * the FIFO above the watermark for seconds). The dropped span
                  * is flagged so the app / post-processing can mark it. */
                 LOG_WRN("IMU FIFO overrun; flushing and resyncing");
-                imu_reset_fifo_parser_state();
+                /* Drop half-built samples, but keep the timestamp base: the
+                 * sensor counter did not restart, so the recording timeline
+                 * must not restart either. */
+                memset(imu_fifo_slots, 0, sizeof(imu_fifo_slots));
                 imu_current_batch_flags = BT_APP_IMU_TS_FLAG_FIFO_OVERRUN;
                 (void)imu_flush_fifo();
                 break;
@@ -569,9 +577,7 @@ static void imu_stream_thread_fn(void *arg1, void *arg2, void *arg3)
                 break; /* fully drained */
             }
 
-            imu_current_batch_flags = 0;
-
-            while (fifo_rows > 0U) {
+            while (fifo_rows > 0U && imu_stream_enabled) {
                 uint8_t fifo_row[IMU_FIFO_ROW_SIZE];
                 uint8_t tag;
                 uint8_t slot_index;
@@ -639,6 +645,11 @@ static void imu_stream_thread_fn(void *arg1, void *arg2, void *arg3)
                 imu_heartbeat_last_ms = now_ms;
                 LOG_INF("IMU alive: %u samples sent", imu_samples_sent_total);
             }
+        }
+
+        if (!imu_stream_enabled) {
+            memset(imu_fifo_slots, 0, sizeof(imu_fifo_slots));
+            k_sem_give(&imu_stream_parked);
         }
     }
 }
@@ -764,7 +775,21 @@ int imu_stream_start(void)
 
 void imu_stream_stop(void)
 {
+    uint32_t wake = 0U;
+
+    /* Reset before publishing the stop request so a prompt park signal cannot
+     * be cleared after the stream thread has already produced it. */
+    k_sem_reset(&imu_stream_parked);
     imu_stream_enabled = false;
+
+    /* Wake the thread instead of waiting for its polling timeout, then wait
+     * until it has left the drain loop before changing registers on the same
+     * I2C bus. */
+    (void)k_msgq_put(&imu_drdy_msgq, &wake, K_NO_WAIT);
+    if (k_sem_take(&imu_stream_parked, K_MSEC(500)) != 0) {
+        LOG_WRN("IMU stream thread did not park before stop");
+    }
+
     imu_reset_fifo_parser_state();
     (void)gpio_pin_interrupt_configure(gpio1_dev, IMU_INT_PIN, GPIO_INT_DISABLE);
     k_msgq_purge(&imu_drdy_msgq);

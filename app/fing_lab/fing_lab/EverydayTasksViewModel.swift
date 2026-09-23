@@ -141,15 +141,15 @@ final class EverydayTasksViewModel {
 
     func advance() {
         guard phase == .taskComplete else { return }
+        if currentTaskIndex + 1 >= tasks.count {
+            finishSession()
+            return
+        }
         currentTaskIndex += 1
         currentTaskStartSampleID = nil
         phaseBeforePause = nil
-        if currentTaskIndex >= tasks.count {
-            finishSession()
-        } else {
-            secondsRemaining = taskDurationSeconds
-            phase = .taskIntro
-        }
+        secondsRemaining = taskDurationSeconds
+        phase = .taskIntro
     }
 
     func cancel() {
@@ -188,6 +188,9 @@ final class EverydayTasksViewModel {
         coordinator.writeMarker(eventType: "task_end", label: currentTask.id)
         FeedbackManager.blockStart()
         phase = .taskComplete
+        if currentTaskIndex + 1 >= tasks.count {
+            finishSession()
+        }
     }
 
     private func finishSession() {

@@ -26,12 +26,14 @@ struct NullRecordingView: View {
         }
         .alert("Stop Recording?", isPresented: $showStopConfirm) {
             Button("Continue", role: .cancel) {}
-            Button("Stop & Save") {
+            Button("Stop") {
                 Task {
                     await viewModel?.stop()
                     dismiss()
                 }
             }
+        } message: {
+            Text("The recording is saved automatically when it stops.")
         }
     }
 
@@ -63,7 +65,7 @@ struct NullRecordingView: View {
             Spacer()
 
             HStack(spacing: 16) {
-                Button("Stop & Save") { showStopConfirm = true }
+                Button("Stop") { showStopConfirm = true }
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
 

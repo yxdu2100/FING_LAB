@@ -130,7 +130,7 @@ struct EverydayTasksView: View {
                     .foregroundStyle(.green)
                 Text("Task Complete")
                     .font(.title.bold())
-                Button(vm.currentTaskIndex + 1 == vm.tasks.count ? "Finish & Save" : "Next Task") {
+                Button(vm.currentTaskIndex + 1 == vm.tasks.count ? "Retry Finalization" : "Next Task") {
                     vm.advance()
                 }
                 .buttonStyle(.borderedProminent)
@@ -144,7 +144,7 @@ struct EverydayTasksView: View {
                 Image(systemName: "externaldrive.fill.badge.checkmark")
                     .font(.system(size: 60))
                     .foregroundStyle(.green)
-                Text("Phase 4 Saved")
+                Text("Phase 4 Saved Automatically")
                     .font(.title.bold())
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)

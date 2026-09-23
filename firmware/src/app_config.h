@@ -81,17 +81,25 @@
  * recording app used when it wrote mems_hover_dataset.
  *
  * Tuned on mems_hover_dataset (144 hover windows from 3 sessions, 288 null
- * windows), testing every 50-sample window: the Y band alone detected 140/144
- * hover windows and fired on 56/288 null windows; the combined rule detects
- * 137/144 and fires on 39/288. Detection was unchanged for tilt 600-700 mg,
- * stillness 120-140 mg and Z max -750..-650 mg, so no limit sits on an edge.
+ * windows), testing every window: the Y band alone detected 140/144 hover
+ * windows and fired on 56/288 null windows. The combined rule detects 138/144
+ * and fires on 51/288 at the 30-sample window used here. Detection was
+ * unchanged for tilt 600-700 mg, stillness 120-140 mg and Z max -750..-650 mg,
+ * so no limit sits on an edge.
+ *
+ * The window length sets the reaction time: every sample in it must match, so
+ * the trigger comes one window after the hand stops moving. 30 samples is
+ * about 265 ms at the ~113 Hz this loop really achieves. Shortening it barely
+ * changes detection but steadily adds false fires: 50 -> 137/144 and 39/288,
+ * 30 -> 138/144 and 51/288, 20 -> 139/144 and 56/288, which is where the
+ * original Y-only rule sat.
  *
  * A complete non-hover window is required before the first trigger, and
  * after every trigger, so a stationary ring cannot repeatedly take photos. */
 #define CAPTURE_HOVER_SAMPLE_RATE_HZ       120U
 #define CAPTURE_HOVER_SAMPLE_PERIOD_US     \
     (1000000U / CAPTURE_HOVER_SAMPLE_RATE_HZ)
-#define CAPTURE_HOVER_WINDOW_SAMPLES       50U
+#define CAPTURE_HOVER_WINDOW_SAMPLES       30U
 #define CAPTURE_HOVER_MAX_Y_RAW            773
 #define CAPTURE_HOVER_MIN_Y_RAW            (-1821)
 #define CAPTURE_HOVER_Z_MIN_RAW            (-5328)  /* -1.30 g */

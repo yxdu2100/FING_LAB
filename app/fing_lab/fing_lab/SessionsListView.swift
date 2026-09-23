@@ -120,6 +120,10 @@ private struct SessionRow: View {
                 Text(DurationFormatterUtil.hms(duration))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+            } else if session.meta.endWallclock == nil {
+                Label("Autosaved interrupted recording", systemImage: "externaldrive.badge.checkmark")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
         }
         .padding(.vertical, 4)

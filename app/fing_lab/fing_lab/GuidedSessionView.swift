@@ -137,7 +137,7 @@ struct GuidedSessionView: View {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 64))
                     .foregroundStyle(.green)
-                Text("Session Complete")
+                Text("Session Saved Automatically")
                     .font(.title.bold())
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)

@@ -9,6 +9,9 @@ final class SessionRecorder {
     private var imuFileHandle: FileHandle?
     private var markersFileHandle: FileHandle?
     private var meta: SessionMeta?
+    private var lastCheckpointDate: Date?
+
+    private let checkpointInterval: TimeInterval = 2
 
     private let fileManager = FileManager.default
     private let sessionsRoot: URL
@@ -42,16 +45,10 @@ final class SessionRecorder {
         try imuHeader.write(to: imuURL, atomically: true, encoding: .utf8)
         try markersHeader.write(to: markersURL, atomically: true, encoding: .utf8)
 
-        imuFileHandle = try FileHandle(forWritingTo: imuURL)
-        imuFileHandle?.seekToEndOfFile()
-
-        markersFileHandle = try FileHandle(forWritingTo: markersURL)
-        markersFileHandle?.seekToEndOfFile()
-
         let now = Date()
         startDate = now
 
-        meta = SessionMeta(
+        let initialMeta = SessionMeta(
             sessionID: sessionID,
             participantID: participantID,
             mode: mode.rawValue,
@@ -75,9 +72,18 @@ final class SessionRecorder {
             peripheralIdentifier: deviceIdentity?.peripheralIdentifier,
             firmwareVersion: deviceIdentity?.firmwareVersion
         )
+        try writeMetadata(initialMeta, to: folder)
 
+        imuFileHandle = try FileHandle(forWritingTo: imuURL)
+        imuFileHandle?.seekToEndOfFile()
+
+        markersFileHandle = try FileHandle(forWritingTo: markersURL)
+        markersFileHandle?.seekToEndOfFile()
+
+        meta = initialMeta
         self.sessionID = sessionID
         folderURL = folder
+        lastCheckpointDate = now
         isRecording = true
     }
 
@@ -100,37 +106,53 @@ final class SessionRecorder {
         handle.write(line.data(using: .utf8) ?? Data())
     }
 
+    /// Keep an active recording recoverable without requiring a final Save
+    /// action. CSV data is already appended continuously; this also flushes
+    /// it and refreshes meta.json at a bounded interval.
+    func checkpointSession(quality: SessionQualitySnapshot) {
+        guard isRecording, let folder = folderURL, var meta else { return }
+
+        apply(quality: quality, to: &meta)
+        self.meta = meta
+
+        let now = Date()
+        guard lastCheckpointDate.map({ now.timeIntervalSince($0) >= checkpointInterval })
+                ?? true else { return }
+
+        imuFileHandle?.synchronizeFile()
+        markersFileHandle?.synchronizeFile()
+        do {
+            try writeMetadata(meta, to: folder)
+            lastCheckpointDate = now
+        } catch {
+            // Finalization will surface a persistent storage error to the UI.
+            // Until then, keep recording rather than dropping incoming data.
+        }
+    }
+
     @discardableResult
     func finalizeSession(quality: SessionQualitySnapshot, notes: String? = nil) throws -> URL? {
         guard isRecording, let folder = folderURL, var meta else { return nil }
 
         imuFileHandle?.synchronizeFile()
         markersFileHandle?.synchronizeFile()
+
+        meta.endWallclock = ISO8601DateFormatter().string(from: Date())
+        apply(quality: quality, to: &meta)
+        if let notes { meta.notes = notes }
+
+        try writeMetadata(meta, to: folder)
+
         imuFileHandle?.closeFile()
         markersFileHandle?.closeFile()
         imuFileHandle = nil
         markersFileHandle = nil
 
-        meta.endWallclock = ISO8601DateFormatter().string(from: Date())
-        meta.totalSamples = quality.totalSamples
-        meta.droppedSamples = quality.droppedSamples
-        meta.hardwareTimestampCount = quality.hardwareTimestampCount
-        meta.interpolatedCount = quality.interpolatedCount
-        meta.fallbackCount = quality.fallbackCount
-        meta.fifoOverrunCount = quality.fifoOverrunCount
-        meta.nonmonotonicCount = quality.nonmonotonicCount
-        meta.disconnectCount = quality.disconnectCount
-        if let notes { meta.notes = notes }
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let metaData = try encoder.encode(meta)
-        try metaData.write(to: folder.appendingPathComponent("meta.json"))
-
         isRecording = false
         self.meta = nil
         sessionID = nil
         startDate = nil
+        lastCheckpointDate = nil
 
         return folder
     }
@@ -150,6 +172,28 @@ final class SessionRecorder {
         sessionID = nil
         folderURL = nil
         startDate = nil
+        lastCheckpointDate = nil
+    }
+
+    private func apply(quality: SessionQualitySnapshot, to meta: inout SessionMeta) {
+        meta.totalSamples = quality.totalSamples
+        meta.droppedSamples = quality.droppedSamples
+        meta.hardwareTimestampCount = quality.hardwareTimestampCount
+        meta.interpolatedCount = quality.interpolatedCount
+        meta.fallbackCount = quality.fallbackCount
+        meta.fifoOverrunCount = quality.fifoOverrunCount
+        meta.nonmonotonicCount = quality.nonmonotonicCount
+        meta.disconnectCount = quality.disconnectCount
+    }
+
+    private func writeMetadata(_ meta: SessionMeta, to folder: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let metaData = try encoder.encode(meta)
+        try metaData.write(
+            to: folder.appendingPathComponent("meta.json"),
+            options: .atomic
+        )
     }
 
     private func nextSessionID() throws -> String {

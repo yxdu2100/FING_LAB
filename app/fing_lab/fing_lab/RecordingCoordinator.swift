@@ -133,6 +133,7 @@ final class RecordingCoordinator {
             guard let self else { return }
             self.quality.ingest(samples)
             self.recorder.appendSamples(samples)
+            self.recorder.checkpointSession(quality: self.quality.snapshot())
         }
 
         ble.onConnectionEvent = { [weak self] event, sampleID in

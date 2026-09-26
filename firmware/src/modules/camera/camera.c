@@ -27,8 +27,8 @@ static uint8_t frame_buf[FRAME_BYTES];
  *
  * With the HM01B0 running at 1 MHz vt_pix_clk, line_length_pck = 800:
  *   line period  ~= 800 us       (active 324 us + H-blank ~476 us)
- *   V-blank      ~= 55.2 ms      (69 blank lines * 800 us)
- *   frame period ~= 250.4 ms     (~4 FPS)
+ *   V-blank      ~= 28.8 ms      (36 blank lines * 800 us)
+ *   frame period ~= 224.0 ms     (~4.5 FPS)
  *
  * LINE_TIMEOUT_US   : must be  >  1 line-period + scheduler jitter
  *                              <  V-blank duration

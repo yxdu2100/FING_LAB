@@ -85,8 +85,11 @@ struct sensor_reg hm01b0_324x244[] = {
     {0x0343,CAMERA_LINE_LENGTH_PCK & 0xFFU},
 
     /* 800 clocks per row leaves about 476 us after each 324 us pixel burst
-     * for Zephyr and the SPIS driver to arm the following row.  313 rows
-     * retain approximately 4 FPS: 1 MHz / (800 * 313) = 3.99 FPS. */
+     * for Zephyr and the SPIS driver to arm the following row.  280 rows give
+     * 1 MHz / (800 * 280) = 4.46 FPS.  The 36 blank rows beyond the 244 active
+     * ones are vertical blanking, which camera.c detects by timing out after
+     * LINE_TIMEOUT_US; 28.8 ms of blanking keeps a 3.6x margin over that 8 ms
+     * timeout while removing 26 ms of dead time from every captured frame. */
     {0x0340,(CAMERA_FRAME_LENGTH_LINES >> 8) & 0xFFU},
     {0x0341,CAMERA_FRAME_LENGTH_LINES & 0xFFU},
     // {0x0342,0x09},

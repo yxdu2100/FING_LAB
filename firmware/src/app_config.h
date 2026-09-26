@@ -4,7 +4,15 @@
 #define TOF_MIN_DISTANCE_MM 60U
 #define TOF_MAX_DISTANCE_MM 500U
 #define CAMERA_CAPTURE_MAX_ATTEMPTS 5
-#define CAMERA_AE_DISCARD_FRAMES 3U
+/* Frames captured and thrown away before the kept frame, so auto-exposure can
+ * settle. Each one costs a full frame period (~224 ms), so this is the largest
+ * single contributor to gesture-to-photo latency.
+ *
+ * CAPTURE keeps the sensor streaming while it waits for a gesture, so AE has
+ * already converged by the time a capture starts: an RTT burst log showed
+ * integration=7 rows, again=0x00, dgain=0x114 identical across all four frames.
+ * One discard is kept to absorb the scene change as the hand settles. */
+#define CAMERA_AE_DISCARD_FRAMES 1U
 
 /* HM01B0 image-quality tuning.
  *
@@ -18,7 +26,7 @@
  */
 #define CAMERA_AE_TARGET_MEAN              0x40U
 #define CAMERA_LINE_LENGTH_PCK             800U
-#define CAMERA_FRAME_LENGTH_LINES          313U
+#define CAMERA_FRAME_LENGTH_LINES          280U
 #define CAMERA_AE_MAX_INTEGRATION_ROWS     30U
 #define CAMERA_AE_MIN_INTEGRATION_ROWS     2U
 #define CAMERA_AE_MAX_ANALOG_GAIN_CODE     0x03U

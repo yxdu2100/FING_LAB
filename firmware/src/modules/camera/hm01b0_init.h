@@ -99,7 +99,9 @@ struct sensor_reg hm01b0_324x244[] = {
     {0x0383,0x01},
     {0x0387,0x01},
     {0x0390,0x00},
-    {0x3011,0x01},
+    /* 0x01 dropped the two low pixel bits (6-bit output, every value a
+     * multiple of 4); 0x70, as in Zephyr's HM01B0 driver, gives 8 bits. */
+    {0x3011,0x70},
     {0x3059,0x22},
     {0x3060,0x30},    // MSB OR LSB
     {0x0101,0x00}, 

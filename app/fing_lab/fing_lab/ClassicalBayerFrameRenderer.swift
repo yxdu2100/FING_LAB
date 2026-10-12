@@ -11,7 +11,7 @@ import UIKit
 /// local contrast, and restrained luminance sharpening.
 enum ClassicalBayerFrameRenderer {
     private static let blackLevel = 8.0
-    private static let whiteLevel = 252.0
+    private static let whiteLevel = 255.0
 
     private static let redGain = 1.082
     private static let greenGain = 1.0

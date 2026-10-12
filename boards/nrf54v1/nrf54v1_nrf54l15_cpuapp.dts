@@ -207,3 +207,9 @@ my_spi_slave: &spi00 {
     /delete-property/ rx-delay-supported;
     /delete-property/ rx-delay;
 };
+/* Internal DC/DC: L1 (4.7 uH) is fitted between DCC and DECD. Cuts radio
+ * and CPU current versus the LDO. */
+&vregmain {
+	status = "okay";
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+};

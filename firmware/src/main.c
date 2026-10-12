@@ -2,6 +2,7 @@
 #include "ble/ble.h"
 #include "modes/mode_manager.h"
 #include <zephyr/toolchain.h>
+#include <nrf_sys_event.h>
 
 BUILD_ASSERT(sizeof(CONFIG_FING_BOARD_ID) > 1,
              "No ring profile selected. Build with "
@@ -16,7 +17,16 @@ int main(void)
 {
     LOG_INF("Starting Fing Lab multi-mode study firmware");
 
-    int err = mode_manager_init();
+    /* In low-power sleep the CPU was observed stuck in WFI with the GRTC
+     * system-timer IRQ pending, freezing the kernel and BLE host until a
+     * debugger halt woke it. Constant-latency mode keeps the wake-up path
+     * powered so the CPU always leaves WFI, at the cost of some idle current. */
+    int err = nrf_sys_event_request_global_constlat();
+    if (err < 0) {
+        LOG_ERR("Could not request constant-latency mode: %d", err);
+    }
+
+    err = mode_manager_init();
     if (err != 0) {
         LOG_ERR("Mode manager initialization failed: %d", err);
         return err;

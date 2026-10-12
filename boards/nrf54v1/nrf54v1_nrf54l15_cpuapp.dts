@@ -176,8 +176,10 @@
 	status = "okay";
 };
 
+/* External flash is unused. spi20's pins are on port 2 (a different power
+ * domain), so enabling it would also require CONFIG_NRF_SYS_EVENT. */
 &spi20 {
-    status = "okay";
+    status = "disabled";
     compatible = "nordic,nrf-spim";
     pinctrl-0 = <&spi20_default>;
 	pinctrl-1 = <&spi20_sleep>;

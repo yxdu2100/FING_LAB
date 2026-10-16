@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -30,30 +31,55 @@ LABELS = {
     3: "phone",
 }
 
+# Keep generated annotation files separate from the source videos.
+ANNOTATION_OUTPUT_DIR = Path(__file__).resolve().parent / "annotated results"
+
 # Amount to seek when the left/right arrow keys are pressed.
 SEEK_STEP_SECONDS = 5
 UI_TEXT_POINT_SIZE = 11
+STATUS_AREA_HEIGHT = 56
+
+
+def resolve_video_path(data_path: str) -> tuple[Path, str]:
+    """Return the MP4 to annotate and the participant name for its CSV file."""
+    source_path = Path(data_path).expanduser().resolve()
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"File or folder does not exist: {source_path}")
+
+    if source_path.is_dir():
+        video_files = sorted(
+            path for path in source_path.iterdir()
+            if path.is_file() and path.suffix.lower() == ".mp4"
+        )
+        if not video_files:
+            raise FileNotFoundError(
+                f"No .mp4 file found in folder: {source_path}"
+            )
+        if len(video_files) > 1:
+            files = ", ".join(path.name for path in video_files)
+            raise ValueError(
+                f"Expected exactly one .mp4 file in {source_path}, found: {files}"
+            )
+        return video_files[0], source_path.name
+
+    if not source_path.is_file() or source_path.suffix.lower() != ".mp4":
+        raise ValueError(f"Expected an .mp4 file or a folder, got: {source_path}")
+
+    # Retain support for a direct MP4 path; its parent folder names the CSV.
+    return source_path, source_path.parent.name
 
 
 class VideoAnnotationTool(QWidget):
-    def __init__(self, video_path: str):
+    def __init__(self, data_path: str):
         super().__init__()
 
-        self.video_path = Path(video_path).resolve()
+        self.video_path, participant_name = resolve_video_path(data_path)
 
-        if not self.video_path.exists():
-            raise FileNotFoundError(
-                f"Video file does not exist: {self.video_path}"
-            )
-
-        if self.video_path.suffix.lower() != ".mp4":
-            raise ValueError(
-                f"Expected an .mp4 file, got: {self.video_path}"
-            )
-
-        # CSV stored beside the video
-        self.csv_path = self.video_path.with_name(
-            f"{self.video_path.stem}_annotations.csv"
+        # Store generated annotations in one dedicated Data subdirectory.
+        ANNOTATION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        self.csv_path = ANNOTATION_OUTPUT_DIR / (
+            f"{participant_name}_annotations.csv"
         )
 
         self.session_start = None
@@ -90,7 +116,13 @@ class VideoAnnotationTool(QWidget):
         # -------------------------
 
         self.video_widget = QVideoWidget()
-        layout.addWidget(self.video_widget)
+        # The video gets all space that is not needed by the controls, so it
+        # grows and shrinks whenever the user resizes the window.
+        self.video_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        layout.addWidget(self.video_widget, 1)
 
         # -------------------------
         # Status
@@ -102,6 +134,10 @@ class VideoAnnotationTool(QWidget):
 
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setFont(self.ui_font())
+        # The status text should only take the room it needs.  Otherwise,
+        # after limiting the video height, Qt may expand this label to fill
+        # the rest of the window.
+        self.status_label.setFixedHeight(STATUS_AREA_HEIGHT)
 
         layout.addWidget(self.status_label)
 
@@ -365,7 +401,7 @@ def parse_args():
         "--data_path",
         required=True,
         type=str,
-        help="Path to the .mp4 video file",
+        help="Path to a participant folder containing one .mp4 file, or an .mp4 file",
     )
 
     return parser.parse_args()
@@ -377,7 +413,7 @@ def main():
     app = QApplication(sys.argv)
 
     window = VideoAnnotationTool(
-        args.data_path
+        args.data_path,
     )
 
     window.show()
